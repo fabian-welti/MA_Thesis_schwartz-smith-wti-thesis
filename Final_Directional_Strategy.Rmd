@@ -1,0 +1,4278 @@
+---
+title: "SS2000 Directional Futures Strategies: Final Analysis"
+author: "Fabian Welti"
+date: "2026-10-12"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: show
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+## Purpose and research design
+
+This notebook contains the standalone directional strategies, including their full process and optimization.
+It starts from importing the futures and T-bill data, rebuilds the annual expanding-window
+Schwartz--Smith (2000) model, evaluates the pre-specified one-contract
+baselines, performs the calibration-only searches, freezes the resulting
+rules, and reports the final risk-sized evidence.
+
+The notebook starts from the raw weekly futures and T-bill files and rebuilds
+the same annual expanding-window SS2000 filter used throughout the rest of the thesis.
+The initial estimation window is 1990--1999, trading begins in 2000, parameters
+are re-estimated at each calendar-year boundary, and only filtered states are
+used. The 2000--2016 period is reported as calibration/development and
+2017--2025 as the out-of-sample evidence.
+
+The analysis distinguishes two economically different hypotheses:
+
+1. **Short-Term-Deviation Contrarian Strategy:** short when the filtered
+   short-term deviation is positive and long when it is negative.
+2. **One-Week Model-Forecast Strategy:** hold the sign of the complete SS2000
+   one-week-ahead log-price forecast change for the actual traded contract.
+
+The calibration section calibrates the contrarian rule on CL1 only and applies
+that frozen rule unchanged to CL2 and CL3 as maturity robustness checks. The
+model-forecast rule is calibrated separately for CL1, CL5, CL9, CL13 and CL17;
+all five maturity-specific results are reported, with no ex-post maturity
+winner selected.
+Selection uses 2000--2016 only. The 2017--2025 period is evaluated only after
+each rule is frozen and is labelled retrospective OOS. All execution uses the
+same underlying-contract roll logic and margin-account conventions as the
+relative-value strategy, with maturity-specific outright margin requirements.
+
+
+## Step 0: Computational Setup and Helper Functions
+This section loads the required packages, defines raw-data and output paths,
+and reproduces the SS2000 estimation and underlying-contract execution. 
+
+```{r setup, message=FALSE, warning=FALSE}
+
+set.seed(42)
+
+#############################################################################
+# STEP 0.1 — Packages
+#############################################################################
+
+library(tidyverse)   # core data stack
+library(lubridate)   # date arithmetic (ymd, as.Date, etc.)
+library(FKF)         # Fast Kalman Filter; state-space model estimation
+library(readxl)      # read_xlsx; for loading DTB3 T-bill data
+library(scales)      # readable axis and table labels
+
+#############################################################################
+# STEP 0.2 — File paths
+#############################################################################
+
+# Find the project from the notebook location 
+find_project_root <- function(start_path) {
+  candidate <- normalizePath(start_path, mustWork = TRUE)
+
+  for (i in 0:10) { 
+    primary_data <- file.path(candidate, "data", "CL_weekly_full_with_underlying_v2.rds")
+    if (file.exists(primary_data)) return(candidate)
+
+    nested_project <- file.path(candidate, "MA Code ", "Master Thesis 1.1")
+    nested_primary <- file.path(nested_project, "data", "CL_weekly_full_with_underlying_v2.rds")
+    if (file.exists(nested_primary)) {
+      return(normalizePath(nested_project, mustWork = TRUE))
+    }
+
+    parent <- dirname(candidate) 
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+
+  stop("Could not locate the Master Thesis 1.1 project folder from: ", start_path)
+}
+
+# During knitting, current_input() points to this R Markdown file. 
+input_file <- tryCatch(
+  knitr::current_input(dir = TRUE),
+  error = function(e) character(0)
+)
+has_input_file <- length(input_file) == 1L &&
+  !is.na(input_file) &&
+  nzchar(input_file)
+
+start_path <- if (has_input_file) dirname(input_file) else getwd()
+DATA_ROOT <- find_project_root(start_path)
+
+# Input: Bloomberg futures data (same .rds file used in the estimation code)
+PATH_FUTURES <- file.path(DATA_ROOT, "data", "CL_weekly_full_with_underlying_v2.rds")
+if (!file.exists(PATH_FUTURES)) {
+  stop("Authoritative futures file not found: ", PATH_FUTURES)
+}
+
+# Input: FRED 3-month T-bill rate (DTB3), weekly, ending Friday
+PATH_TBILL <- file.path(DATA_ROOT, "data", "DTB3.xlsx")
+
+# Output: every table and data object created by this notebook stays beside it.
+# When code is run interactively, rebuild the notebook path from DATA_ROOT.
+NOTEBOOK_DIR <- if (has_input_file) {
+  normalizePath(dirname(input_file), mustWork = TRUE)
+} else {
+  final_dir <- file.path(
+    DATA_ROOT, "output", "Strategies", "Directional Strategy", "Final_Submission"
+  )
+  normalizePath(final_dir, mustWork = TRUE)
+}
+PATH_OUTPUT <- file.path(NOTEBOOK_DIR, "results")
+dir.create(PATH_OUTPUT, showWarnings = FALSE, recursive = TRUE)
+
+#############################################################################
+# STEP 0.3 — Strategy constants
+#
+# All key design parameters are defined in one place here.
+#############################################################################
+
+# Contracts used in the Kalman filter measurement equation (identical to
+# the estimation code; all five are used for state extraction)
+CONTRACTS <- c("CL1 Comdty", "CL5 Comdty", "CL9 Comdty", "CL13 Comdty", "CL17 Comdty")
+
+# Row identifiers within the five-contract estimation panel.
+IDX_CL1  <- 1L
+IDX_CL17 <- 5L
+
+# Weekly time step in year units (exact, consistent with estimation code)
+DELTA_T <- 7 / 365.25
+
+# Sample boundaries
+TRAIN_START  <- as.Date("1990-01-05")   # first week included in any training window
+FIRST_TRADE  <- as.Date("2000-01-01")   # first week of out-of-sample trading
+                                         # (training block 1 = 1990-01-05 to 1999-12-31)
+
+# Multi-start count for MLE optimisation 
+N_STARTS <- 8L
+
+# Development flag: set to TRUE to run a short test window only.
+# Set to FALSE to run the full sample through 2025.
+# When DEV_MODE = TRUE the strategy runs the 10Y-init setup through DEV_END only.
+DEV_MODE <- FALSE
+DEV_END  <- as.Date("2003-12-26")
+
+
+#############################################################################
+# STEP 0.4 — Custom print method for theta_hat objects
+#
+# Same as S&S 2000 Full Timeline.
+#############################################################################
+
+print.theta_hat <- function(x, ...) {
+  y <- x
+  if ("sigma_obs_raw" %in% names(y)) y$sigma_obs_raw <- NULL
+  old_class <- class(y)
+  class(y) <- setdiff(old_class, "theta_hat")
+  print(y, ...)
+  invisible(x)
+}
+
+#############################################################################
+# STEP 0.4b — Execution helper functions
+#
+# These helpers support the explicit underlying-contract execution layer.
+# Signals are defined for generic maturity ranks, while P&L and transaction
+# costs are computed on the actual underlying futures ticker held through each
+# weekly interval.
+#############################################################################
+
+generic_rank_from_name <- function(x) {
+  as.integer(stringr::str_match(x, "^CL(\\d+) Comdty")[, 2])
+}
+
+sort_generic_cols <- function(cols) {
+  cols[order(generic_rank_from_name(cols))]
+}
+
+match_ticker_index <- function(und_row, ticker) {
+  idx <- which(!is.na(und_row) & und_row == ticker)
+  if (length(idx) == 0L) NA_integer_ else idx[1L]
+}
+
+lookup_ticker_price <- function(px_row, und_row, ticker) {
+  idx <- match_ticker_index(und_row, ticker)
+  if (is.na(idx)) NA_real_ else as.numeric(px_row[idx])
+}
+
+lookup_ticker_ltd <- function(ltd_row, und_row, ticker) {
+  idx <- match_ticker_index(und_row, ticker)
+  if (is.na(idx)) return(as.Date(NA))
+  val <- ltd_row[idx]
+  if (inherits(val, "Date")) return(as.Date(val))
+  if (is.numeric(val)) return(as.Date(val, origin = "1970-01-01"))
+  as.Date(as.character(val))
+}
+
+next_ticker_in_ladder <- function(und_row, ticker) {
+  idx <- match_ticker_index(und_row, ticker)
+  if (is.na(idx)) return(NA_character_)
+  later_idx <- which(!is.na(und_row) & seq_along(und_row) > idx)
+  if (length(later_idx) == 0L) NA_character_ else und_row[later_idx[1L]]
+}
+
+choose_execution_ticker <- function(held_ticker, generic_ticker_next,
+                                    prev_und_row, prev_ltd_row, next_obs_date) {
+  advance_if_unsafe <- function(ticker) {
+    if (is.na(ticker) || ticker == "") return(NA_character_)
+    current_ticker <- ticker
+    visited <- character()
+
+    repeat {
+      if (current_ticker %in% visited) {
+        stop("Unsafe execution ladder cycle detected for ticker ", ticker)
+      }
+      visited <- c(visited, current_ticker)
+
+      if (is.na(match_ticker_index(prev_und_row, current_ticker))) {
+        stop("Ticker ", current_ticker, " not found in prior-week execution ladder")
+      }
+
+      ticker_ltd <- lookup_ticker_ltd(prev_ltd_row, prev_und_row, current_ticker)
+      ticker_unsafe <- !is.na(ticker_ltd) && ticker_ltd <= next_obs_date
+      if (!ticker_unsafe) return(current_ticker)
+
+      next_ticker <- next_ticker_in_ladder(prev_und_row, current_ticker)
+      if (is.na(next_ticker) || next_ticker == "") {
+        stop("No safe successor found in execution ladder for ticker ", current_ticker)
+      }
+      current_ticker <- next_ticker
+    }
+  }
+
+  if (is.na(generic_ticker_next) || generic_ticker_next == "") {
+    return(NA_character_)
+  }
+  if (is.na(held_ticker) || held_ticker == "") {
+    return(advance_if_unsafe(generic_ticker_next))
+  }
+
+  if (is.na(match_ticker_index(prev_und_row, held_ticker))) {
+    stop("Carried ticker ", held_ticker, " not found in prior-week execution ladder")
+  }
+
+  held_ltd <- lookup_ticker_ltd(prev_ltd_row, prev_und_row, held_ticker)
+  generic_switch <- held_ticker != generic_ticker_next
+  ltd_unsafe <- !is.na(held_ltd) && held_ltd <= next_obs_date
+
+  if (generic_switch) {
+    return(advance_if_unsafe(generic_ticker_next))
+  }
+
+  if (ltd_unsafe) {
+    next_ticker <- next_ticker_in_ladder(prev_und_row, held_ticker)
+    if (!is.na(next_ticker) && next_ticker != "") {
+      return(next_ticker)
+    }
+    return(generic_ticker_next)
+  }
+
+  held_ticker
+}
+
+#############################################################################
+# STEP 0.5 — Model helper functions
+#
+# Same as S&S 2000 Full Timeline (Steps 2 and 3).
+# These are the exact same functions used for estimation, ensuring that the
+# state-space system constructed during the forward filter in the strategy
+# is identical to what was used during training.
+#############################################################################
+
+# ── A(T): maturity-dependent constant term in log futures pricing equation ──
+# Equation (9) / A(T) in Schwartz & Smith (2000).
+A_fun <- function(T, kappa, mu_star, sigma_chi, sigma_xi, rho, lambda_chi) {
+  var_lnS <- (sigma_chi^2 / (2 * kappa)) * (1 - exp(-2 * kappa * T)) +
+    sigma_xi^2 * T +
+    2 * rho * sigma_chi * sigma_xi * (1 - exp(-kappa * T)) / kappa
+  mu_star * T - (1 - exp(-kappa * T)) * (lambda_chi / kappa) + 0.5 * var_lnS
+}
+
+# ── W(Δt): discretised process noise covariance for state transition ────────
+process_W <- function(Delta_t, kappa, sigma_chi, sigma_xi, rho) {
+  var_chi    <- (sigma_chi^2 / (2 * kappa)) * (1 - exp(-2 * kappa * Delta_t))
+  var_xi     <- sigma_xi^2 * Delta_t
+  cov_chi_xi <- rho * sigma_chi * sigma_xi * (1 - exp(-kappa * Delta_t)) / kappa
+  matrix(c(var_chi, cov_chi_xi,
+           cov_chi_xi, var_xi), nrow = 2, byrow = TRUE)
+}
+
+# ── make_ss_arrays(): build all FKF-ready state-space arrays ────────────────
+# Constructs Zt (measurement matrix), ct (measurement intercept), GGt
+# (measurement noise), Tt (transition matrix), dt (state drift), HHt
+# (state noise) for a given theta and Tau matrix.
+make_ss_arrays <- function(theta, Tau, Delta_t) {
+  T_len <- ncol(Tau)
+  m     <- nrow(Tau)
+  n     <- 2L          # states: (chi, xi)
+
+  with(as.list(theta), {
+
+    Ft <- array(0, dim = c(m, n, T_len))
+    d  <- matrix(0, nrow = m, ncol = T_len)
+
+    for (tt in seq_len(T_len)) {
+      tau_t      <- Tau[, tt]
+      Ft[, , tt] <- cbind(exp(-kappa * tau_t), rep(1, m))
+      d[, tt]    <- A_fun(tau_t, kappa, mu_star, sigma_chi, sigma_xi, rho, lambda_chi)
+    }
+
+    V <- diag(sigma_obs_vec^2, m)
+
+    Tt  <- array(0, dim = c(n, n, T_len))
+    dt  <- matrix(0, nrow = n, ncol = T_len)
+    HHt <- array(0, dim = c(n, n, T_len))
+
+    for (tt in seq_len(T_len)) {
+      G_t <- matrix(c(exp(-kappa * Delta_t), 0,
+                      0,                     1),
+                    nrow = n, byrow = TRUE)
+      c_t <- c(0, mu * Delta_t)
+      W_t <- process_W(Delta_t, kappa, sigma_chi, sigma_xi, rho)
+      Tt[, , tt]  <- G_t
+      dt[, tt]    <- c_t
+      HHt[, , tt] <- W_t
+    }
+
+    list(
+      Zt  = Ft,
+      ct  = d,
+      HHt = HHt,
+      GGt = array(V, dim = c(m, m, T_len)),
+      Tt  = Tt,
+      dt  = dt
+    )
+  })
+}
+
+# ── apply_missing_mask_fkf(): handle NAs in Y for FKF ───────────────────────
+# Missing observations are neutralised by zeroing out their rows in Zt/ct
+# and inflating their measurement variance to a large number so the filter
+# ignores them. Placeholder value of 0 is written into y_tilde.
+apply_missing_mask_fkf <- function(Y, ss, big_var = NULL, big_var_mult = 1e6) {
+  m     <- dim(ss$Zt)[1]
+  T_len <- ncol(Y)
+
+  y_tilde <- Y
+  y_tilde[is.na(y_tilde)] <- 0
+
+  Zt_new  <- ss$Zt
+  ct_new  <- ss$ct
+  GGt_new <- ss$GGt
+
+  I <- diag(1, m)
+
+  if (is.null(big_var)) {
+    Vdiag <- diag(ss$GGt[, , 1])
+    Vmed  <- median(Vdiag[is.finite(Vdiag) & Vdiag > 0])
+    if (!is.finite(Vmed)) Vmed <- 1.0
+    big_var <- big_var_mult * Vmed
+  }
+
+  for (tt in seq_len(T_len)) {
+    miss         <- is.na(Y[, tt])
+    M            <- diag(as.numeric(!miss), m, m)
+    Zt_new[, , tt] <- M %*% Zt_new[, , tt]
+    ct_new[, tt]   <- M %*% ct_new[, tt]
+    V_base         <- GGt_new[, , tt]
+    GGt_new[, , tt] <- M %*% V_base %*% M + (I - M) * big_var
+  }
+
+  list(yt  = y_tilde, Zt  = Zt_new, ct  = ct_new,
+       GGt = GGt_new, Tt  = ss$Tt,  dt  = ss$dt, HHt = ss$HHt)
+}
+
+# ── softplus(): smooth R → R+ transform for measurement error parameters ────
+softplus <- function(x) log1p(exp(-abs(x))) + pmax(x, 0)
+
+# ── pack(): map theta list → unconstrained optimizer vector ─────────────────
+pack <- function(theta) c(
+  log(theta$kappa),
+  theta$mu,
+  theta$mu_star,
+  log(theta$sigma_chi),
+  log(theta$sigma_xi),
+  atanh(theta$rho),
+  theta$lambda_chi,
+  theta$sigma_obs_raw
+)
+
+# ── unpack(): map optimizer vector → theta list (natural scale) ──────────────
+unpack <- function(p) {
+  if (length(p) < 8L) stop("unpack(): parameter vector too short (need >= 8 elements).")
+  sigma_obs_raw <- as.numeric(p[8:length(p)])
+  eps_sd        <- 1e-8
+  list(
+    kappa         = exp(p[1]),
+    mu            = p[2],
+    mu_star       = p[3],
+    sigma_chi     = exp(p[4]),
+    sigma_xi      = exp(p[5]),
+    rho           = tanh(p[6]),
+    lambda_chi    = p[7],
+    sigma_obs_raw = sigma_obs_raw,
+    sigma_obs_vec = softplus(sigma_obs_raw) + eps_sd
+  )
+}
+
+# ── sample_start(): randomised but economically plausible starting values ───
+# Called N_STARTS times in the MLE routine; identical to estimation code.
+sample_start <- function() {
+  sigma_obs_raw0 <- rnorm(length(CONTRACTS), mean = 0.12, sd = 0.10)
+  list(
+    kappa         = runif(1, 0.5, 5),
+    mu            = runif(1, -0.10, 0.10),
+    mu_star       = runif(1, -0.10, 0.10),
+    sigma_chi     = runif(1, 0.05, 0.5),
+    sigma_xi      = runif(1, 0.05, 0.5),
+    rho           = runif(1, -0.95, 0.95),
+    lambda_chi    = runif(1, -1, 1),
+    sigma_obs_raw = sigma_obs_raw0
+  )
+}
+
+# ── compute_prior_from_first_L(): data-based Kalman prior ───────────────────
+# Pools the first L measurement equations (after removing A(tau) intercepts)
+# and estimates initial (chi0, xi0) by OLS. Falls back to a diffuse prior if
+# there is insufficient early data — critical for the first training block.
+compute_prior_from_first_L <- function(Zt, ct, yt, L = 6, inflate = 2.0, nugget = 1e-8) {
+  L <- min(L, ncol(yt))
+  stopifnot(L >= 2)
+
+  X_stack <- NULL
+  y_stack <- NULL
+
+  for (t in seq_len(L)) {
+    Ft_full <- Zt[, , t]
+    dtvec   <- ct[, t]
+    yvec    <- yt[, t]
+    obs     <- rowSums(abs(Ft_full)) > 0
+    if (sum(obs) < 2L) next
+    Ft      <- Ft_full[obs, , drop = FALSE]
+    yy      <- as.vector(yvec[obs] - dtvec[obs])
+    X_stack <- rbind(X_stack, Ft)
+    y_stack <- c(y_stack, yy)
+  }
+
+  if (is.null(X_stack) || length(y_stack) < 6L) {
+    return(list(m0 = c(0, 0), P0 = diag(1e6, 2)))
+  }
+
+  fit <- lm.fit(x = X_stack, y = y_stack)
+  m0  <- as.vector(fit$coefficients)
+
+  if (any(!is.finite(m0))) {
+    return(list(m0 = c(0, 0), P0 = diag(1e6, 2)))
+  }
+
+  n_obs   <- length(y_stack)
+  p_dim   <- ncol(X_stack)
+  rss     <- sum(fit$residuals^2)
+  s2      <- rss / max(1, n_obs - p_dim)
+
+  XtX_inv <- tryCatch(
+    solve(crossprod(X_stack) + diag(nugget, p_dim)),
+    error = function(e) NULL
+  )
+
+  if (is.null(XtX_inv) || any(!is.finite(XtX_inv))) {
+    P0 <- diag(1e6, 2)
+  } else {
+    P0 <- inflate * (s2 * XtX_inv + diag(nugget, p_dim))
+    if (any(!is.finite(P0)) || det(P0) <= 0) P0 <- diag(1e6, 2)
+  }
+
+  list(m0 = m0, P0 = P0)
+}
+
+# ── loglik(): negative log-likelihood for optim() ───────────────────────────
+# Identical to the estimation code. Takes the packed optimizer vector p,
+# builds the state-space system, applies the missing mask, initialises the
+# prior, runs the Kalman filter, and returns the negative log-likelihood.
+loglik <- function(p, Y, Tau, Delta_t) {
+  theta  <- unpack(p)
+  ss     <- make_ss_arrays(theta, Tau, Delta_t)
+  if (any(!is.finite(ss$ct))) return(1e6)
+  masked <- apply_missing_mask_fkf(Y, ss)
+  L_use  <- max(4L, min(6L, ncol(Y)))
+  prior  <- tryCatch(
+    compute_prior_from_first_L(masked$Zt, masked$ct, masked$yt,
+                               L = L_use, inflate = 2.0),
+    error = function(e) list(m0 = c(0, 0), P0 = diag(1e6, 2))
+  )
+  kf <- tryCatch(
+    fkf(a0  = prior$m0,  P0  = prior$P0,
+        dt  = masked$dt, ct  = masked$ct,
+        Tt  = masked$Tt, Zt  = masked$Zt,
+        HHt = masked$HHt, GGt = masked$GGt,
+        yt  = masked$yt),
+    error = function(e) NULL
+  )
+  if (is.null(kf) || !is.finite(kf$logLik)) return(1e6)
+  -kf$logLik
+}
+
+#############################################################################
+# STEP 0.6 — Sanity check: verify all required functions exist
+#############################################################################
+
+required_fns <- c(
+  "A_fun", "process_W", "make_ss_arrays", "apply_missing_mask_fkf",
+  "softplus", "pack", "unpack", "sample_start",
+  "compute_prior_from_first_L", "loglik"
+)
+
+setup_env <- environment()
+missing_fns <- required_fns[
+  !vapply(required_fns, function(fn) {
+    exists(fn, envir = setup_env, mode = "function", inherits = TRUE)
+  }, logical(1))
+]
+
+if (length(missing_fns) > 0L) {
+  stop("Step 0 incomplete — the following functions are missing: ",
+       paste(missing_fns, collapse = ", "))
+} else {
+  message("✓ Step 0 complete — all ", length(required_fns),
+          " helper functions loaded successfully.")
+  message("✓ Research constants set:")
+  message("    Training start     : ", TRAIN_START)
+  message("    First trade        : ", FIRST_TRADE)
+  message("    DEV_MODE           : ", DEV_MODE,
+          if (DEV_MODE) paste0(" (through ", DEV_END, ")") else "")
+  message("    Estimation panel   : ", paste(CONTRACTS, collapse = ", "))
+  message("    Execution          : one actual underlying contract per strategy")
+}
+
+```
+
+
+## Step 1: Data Loading, Matrix Construction and Roll Flags
+This section loads all data required for the strategy. The futures data
+loading and matrix construction (Y, Tau, obs_dates) is identical to
+the S&S 2000 Full Timeline code, using the same .rds file, same column
+conventions, same CL1 edge-case fix, same NA masking logic. After
+building those matrices the section adds three things the estimation
+code did not need: a subsetting of all matrices to the 1990 training
+start, construction of binary roll flags for CL1 and CL17, and loading
+of the DTB3 T-bill rate aligned to obs_dates.
+
+```{r step1, message=TRUE, warning=FALSE}
+
+#############################################################################
+# STEP 1.0 — Load Bloomberg futures data
+#############################################################################
+
+weekly_full <- readr::read_rds(PATH_FUTURES) %>%
+  dplyr::mutate(date = as.Date(date))
+
+# Column name vectors for the 5-contract signal set (built from CONTRACTS)
+needed_px  <- paste0(CONTRACTS, "__PX")
+needed_und <- paste0(CONTRACTS, "__UND")
+needed_ltd <- paste0(CONTRACTS, "__LTD")
+
+# Full generic ladder used by the underlying-contract execution engine.
+all_px_cols  <- sort_generic_cols(grep("__PX$",  names(weekly_full), value = TRUE))
+all_und_cols <- sort_generic_cols(grep("__UND$", names(weekly_full), value = TRUE))
+all_ltd_cols <- sort_generic_cols(grep("__LTD$", names(weekly_full), value = TRUE))
+
+# Safety: verify all required columns exist
+stopifnot(all(needed_px  %in% names(weekly_full)))
+stopifnot(all(needed_ltd %in% names(weekly_full)))
+stopifnot(all(needed_und %in% names(weekly_full)))
+stopifnot(length(all_px_cols)  == length(all_und_cols))
+stopifnot(length(all_px_cols)  == length(all_ltd_cols))
+
+# Sort by date
+weekly_win <- weekly_full %>%
+  dplyr::arrange(date)
+
+# Full price / UND / LTD ladders by date, required for explicit held-contract
+# execution. Rows are dates; columns are generic maturity slots CL1...CL120.
+PX_ALL_full <- weekly_win %>%
+  dplyr::select(dplyr::all_of(all_px_cols)) %>%
+  as.matrix()
+storage.mode(PX_ALL_full) <- "double"
+
+UND_ALL_full <- weekly_win %>%
+  dplyr::select(dplyr::all_of(all_und_cols)) %>%
+  as.matrix()
+
+LTD_ALL_full <- weekly_win %>%
+  dplyr::select(dplyr::all_of(all_ltd_cols)) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.character)) %>%
+  as.matrix()
+
+#############################################################################
+# STEP 1.1 — Build log-price observation matrix Y
+# Rows = contracts (CL1, CL5, CL9, CL13, CL17), Cols = observation dates
+#############################################################################
+
+weekly_log <- weekly_win %>%
+  dplyr::transmute(
+    obs_date = date,
+    dplyr::across(
+      dplyr::all_of(needed_px),
+      ~ ifelse(is.na(.x), NA_real_, log(as.numeric(.x))),
+      .names = "log_{.col}"
+    )
+  )
+
+Y_full <- weekly_log %>%
+  dplyr::select(dplyr::starts_with("log_")) %>%
+  as.matrix() %>%
+  t()
+
+storage.mode(Y_full) <- "double"
+
+obs_dates_full <- weekly_log$obs_date
+colnames(Y_full) <- as.character(obs_dates_full)
+
+#############################################################################
+# STEP 1.2 — Build time-to-maturity matrix Tau
+# Tau_{i,t} = (LTD_{i,t} - obs_date_t) / 365.25
+#############################################################################
+
+LTD_df <- weekly_win %>%
+  dplyr::select(date, dplyr::all_of(needed_ltd))
+
+LTD_mat <- LTD_df %>%
+  dplyr::select(-date) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.Date)) %>%
+  as.matrix()
+
+Tau_full <- matrix(NA_real_,
+                   nrow = length(CONTRACTS),
+                   ncol = length(obs_dates_full))
+rownames(Tau_full) <- CONTRACTS
+colnames(Tau_full) <- as.character(obs_dates_full)
+
+for (j in seq_along(obs_dates_full)) {
+  tdate   <- obs_dates_full[j]
+  ltd_vec <- as.Date(LTD_mat[j, ])
+  tau_vec <- as.numeric(ltd_vec - tdate) / 365.25
+  tau_vec[is.na(ltd_vec) | tau_vec <= 0] <- NA_real_
+  Tau_full[, j] <- tau_vec
+}
+
+#############################################################################
+# STEP 1.3 — CL1 edge-case fix + NA cleanup
+#############################################################################
+
+# CL1 row indices (same in both Y and Tau; contracts are in the same order)
+cl1_row_Y   <- which(rownames(Y_full)   == paste0("log_", CONTRACTS[IDX_CL1], "__PX"))
+cl1_row_Tau <- IDX_CL1   # = 1
+
+stopifnot(length(cl1_row_Y) == 1L)
+
+# Weeks where CL1 is on or past its LTD; drop the observation, keep Tau = 0
+bad_cl1 <- which(is.na(Tau_full[cl1_row_Tau, ]) | Tau_full[cl1_row_Tau, ] <= 0)
+Y_full[cl1_row_Y, bad_cl1]      <- NA_real_
+Tau_full[cl1_row_Tau, bad_cl1]  <- 0        # keep finite for make_ss_arrays()
+
+# Propagate: wherever Tau is NA, Y must also be NA
+Y_full[is.na(Tau_full)] <- NA_real_
+
+# Replace all remaining NA in Tau with 0 (required by make_ss_arrays)
+Tau_full[is.na(Tau_full)] <- 0
+
+#############################################################################
+# STEP 1.4 — Load and align DTB3 T-bill rate
+#
+# Source: FRED series DTB3, sheet "Weekly, Ending Friday"
+# Rate is annualised percent (e.g. 5.25 = 5.25% p.a.), discount basis.
+# We forward-fill any missing weeks (holiday gaps) then align to obs_dates_full.
+#############################################################################
+
+dtb3_raw <- readxl::read_xlsx(PATH_TBILL, sheet = "Weekly, Ending Friday") %>%
+  dplyr::transmute(
+    date  = as.Date(observation_date),
+    dtb3  = as.numeric(DTB3)
+  ) %>%
+  dplyr::arrange(date)
+
+# Forward-fill any NA rates (FRED occasionally has gaps on holiday weeks)
+dtb3_raw <- dtb3_raw %>%
+  tidyr::fill(dtb3, .direction = "down")
+
+# Align to obs_dates_full via a left join; futures dates are the master
+# For any futures date with no exact T-bill match, carry forward the
+# most recent available rate (rolling join using dplyr + fill)
+tbill_aligned <- dplyr::tibble(date = obs_dates_full) %>%
+  dplyr::left_join(dtb3_raw, by = "date") %>%
+  tidyr::fill(dtb3, .direction = "down")
+
+dtb3_full <- tbill_aligned$dtb3   # length = length(obs_dates_full)
+
+#############################################################################
+# STEP 1.5 — Subset everything to TRAIN_START (1990-01-05)
+#
+# The full matrices go back to 1984 but CL17 has gaps before 1990.
+# All strategy work uses only obs_dates >= TRAIN_START.
+# We keep _full objects intact and create clean _strat objects for all steps.
+#############################################################################
+
+strat_idx <- which(obs_dates_full >= TRAIN_START)
+
+obs_dates  <- obs_dates_full[strat_idx]          # master date vector from here on
+Y          <- Y_full[,   strat_idx, drop = FALSE] # 5 x T_strat log-price matrix
+Tau        <- Tau_full[, strat_idx, drop = FALSE] # 5 x T_strat maturity matrix
+dtb3       <- dtb3_full[strat_idx]                # length T_strat T-bill rate
+PX_ALL     <- PX_ALL_full[strat_idx,  , drop = FALSE]
+UND_ALL    <- UND_ALL_full[strat_idx, , drop = FALSE]
+LTD_ALL    <- LTD_ALL_full[strat_idx, , drop = FALSE]
+
+#############################################################################
+# STEP 1.6 — Sanity checks
+#############################################################################
+
+# 1. Dimension consistency
+stopifnot(ncol(Y)   == length(obs_dates))
+stopifnot(ncol(Tau) == length(obs_dates))
+stopifnot(length(dtb3)      == length(obs_dates))
+stopifnot(nrow(PX_ALL)      == length(obs_dates))
+stopifnot(nrow(UND_ALL)     == length(obs_dates))
+stopifnot(nrow(LTD_ALL)     == length(obs_dates))
+
+# 2. Date range
+stopifnot(min(obs_dates) >= TRAIN_START)
+
+# 3. No non-finite values in Tau (make_ss_arrays requires this)
+stopifnot(all(is.finite(Tau)))
+
+# 4. T-bill rate: no NAs after forward-fill
+n_tbill_na <- sum(is.na(dtb3))
+if (n_tbill_na > 0L) {
+  warning("DTB3 has ", n_tbill_na, " NAs after forward-fill — check date alignment.")
+}
+
+# 5. Weekly gap check on strategy subsample
+dt_days <- as.numeric(diff(obs_dates))
+gaps_ok <- all(dt_days == 7L)
+
+#############################################################################
+# STEP 1.7 — Confirmation messages
+#############################################################################
+
+message("✓ Step 1 complete")
+message("  Strategy sample   : ", min(obs_dates), " → ", max(obs_dates))
+message("  Total weeks       : ", length(obs_dates))
+message("  Y dimensions      : ", nrow(Y), " contracts × ", ncol(Y), " weeks")
+message("  Tau non-finite    : ", sum(!is.finite(Tau)), " (must be 0)")
+message("  T-bill NAs        : ", n_tbill_na, " (must be 0)")
+message("  DTB3 range        : ", round(min(dtb3, na.rm = TRUE), 2),
+        "% – ", round(max(dtb3, na.rm = TRUE), 2), "%")
+message("  Full ladder cols   : ", ncol(PX_ALL))
+message("  All gaps = 7 days : ", gaps_ok)
+
+```
+
+
+## Step 2: Rebalancing Schedule
+This section constructs the complete rebalancing schedule used in Step 5.
+Rebalancing is anchored to calendar year
+boundaries read directly from obs_dates, no hardcoded week counts. For
+each block the schedule records the integer indices into obs_dates for
+the training window end, the trading window start, and the trading
+window end. DEV_MODE is applied here, truncating the schedule to DEV_END
+before any estimation begins.
+
+```{r step2, message=TRUE, warning=FALSE}
+
+#############################################################################
+# STEP 2.0 — Apply DEV_MODE truncation
+#
+# If DEV_MODE = TRUE, we restrict obs_dates (and all aligned vectors) to
+# dates up to and including DEV_END. This does NOT reload any data,
+# it simply shortens the working vectors that all downstream steps use.
+# To switch to the full sample, set DEV_MODE <- FALSE in Step 0 and rerun.
+#############################################################################
+
+if (DEV_MODE) {
+  dev_idx    <- which(obs_dates <= DEV_END)
+  obs_dates  <- obs_dates[dev_idx]
+  Y          <- Y[,    dev_idx, drop = FALSE]
+  Tau        <- Tau[,  dev_idx, drop = FALSE]
+  dtb3       <- dtb3[dev_idx]
+  PX_ALL     <- PX_ALL[dev_idx,  , drop = FALSE]
+  UND_ALL    <- UND_ALL[dev_idx, , drop = FALSE]
+  LTD_ALL    <- LTD_ALL[dev_idx, , drop = FALSE]
+  message("DEV_MODE = TRUE — sample truncated to ", min(obs_dates), " → ", max(obs_dates))
+} else {
+  message("DEV_MODE = FALSE — using full sample ", min(obs_dates), " → ", max(obs_dates))
+}
+
+#############################################################################
+# STEP 2.1 — Identify trading years from obs_dates
+#
+# Trading years are all calendar years in obs_dates that are >= year(FIRST_TRADE).
+# Each trading year t uses:
+#   - Training window : all obs_dates from TRAIN_START through end of year t-1
+#   - Trading window  : all obs_dates where year(obs_date) == t
+#
+# We derive everything from the actual dates in obs_dates, so missing weeks
+# or irregular gaps never cause the schedule to drift.
+#############################################################################
+
+all_years      <- lubridate::year(obs_dates)
+trading_years  <- sort(unique(all_years[obs_dates >= FIRST_TRADE]))
+
+stopifnot(length(trading_years) >= 1L)
+
+#############################################################################
+# STEP 2.2 — Build the schedule data frame
+#
+# One row per trading year. All columns are integer indices into obs_dates
+#
+# Columns:
+#   trading_year     : calendar year being traded (e.g. 2000)
+#   train_start_idx  : first index of training window (always 1 = TRAIN_START)
+#   train_end_idx    : last index where year < trading_year
+#   trade_start_idx  : first index where year == trading_year
+#   trade_end_idx    : last index where year == trading_year
+#   n_train_weeks    : number of training observations
+#   n_trade_weeks    : number of trading observations
+#############################################################################
+
+schedule <- purrr::map_dfr(trading_years, function(yr) {
+
+  # Training window: TRAIN_START up to and including last week of year yr-1
+  train_idx  <- which(all_years < yr)
+
+  # Trading window: all weeks in calendar year yr
+  trade_idx  <- which(all_years == yr)
+
+  # Both must be non-empty, if not, this year cannot be traded
+  if (length(train_idx) == 0L || length(trade_idx) == 0L) return(NULL)
+
+  dplyr::tibble(
+    trading_year    = yr,
+    train_start_idx = min(train_idx),   # always index 1 (TRAIN_START), expanding window
+    train_end_idx   = max(train_idx),   # last week before this trading year
+    trade_start_idx = min(trade_idx),   # first week of this trading year
+    trade_end_idx   = max(trade_idx),   # last week of this trading year
+    n_train_weeks   = length(train_idx),
+    n_trade_weeks   = length(trade_idx)
+  )
+})
+
+stopifnot(nrow(schedule) >= 1L)
+
+# Verify expanding window property: train_end_idx must strictly increase
+stopifnot(all(diff(schedule$train_end_idx) > 0L))
+
+# Verify no overlap between training and trading windows
+stopifnot(all(schedule$train_end_idx < schedule$trade_start_idx))
+
+# Verify contiguous trading windows (trade_end of year k+1 > trade_end of year k)
+stopifnot(all(diff(schedule$trade_end_idx) > 0L))
+
+#############################################################################
+# STEP 2.3 — Confirmation messages
+#############################################################################
+
+message("✓ Step 2 complete — rebalancing schedule built")
+message("  Trading years     : ", min(schedule$trading_year),
+        " → ", max(schedule$trading_year),
+        "  (", nrow(schedule), " blocks)")
+message("  Training weeks    : ",
+        min(schedule$n_train_weeks), " (block 1) → ",
+        max(schedule$n_train_weeks), " (block ", nrow(schedule), ")")
+message("  Trading weeks/yr  : ",
+        min(schedule$n_trade_weeks), " – ",
+        max(schedule$n_trade_weeks))
+message("")
+message("  Schedule preview:")
+
+# Print the full schedule cleanly
+print(
+  schedule %>%
+    dplyr::mutate(
+      train_start_date = obs_dates[train_start_idx],
+      train_end_date   = obs_dates[train_end_idx],
+      trade_start_date = obs_dates[trade_start_idx],
+      trade_end_date   = obs_dates[trade_end_idx]
+    ) %>%
+    dplyr::select(
+      trading_year,
+      train_start_date, train_end_date, n_train_weeks,
+      trade_start_date, trade_end_date, n_trade_weeks
+    ),
+  n = Inf
+)
+
+```
+
+
+## Step 3: Parameter Estimation Function
+This section wraps the MLE estimation logic into a single callable function
+estimate_ss(). The function takes a training window subset of Y and Tau,
+runs the multi-start BFGS optimisation, and returns the best theta_hat.
+It is called once per rebalancing block in the outer loop (Step 7). The
+estimation logic is identical to the S&S 2000 Full Timeline code; only the function
+interface differs.
+
+```{r step3, message=TRUE, warning=FALSE}
+
+#############################################################################
+# STEP 3.0 — estimate_ss(): MLE estimation for one training window
+#
+# Arguments:
+#   Y_train   : 5 x n_train log-price matrix (subset of Y)
+#   Tau_train : 5 x n_train maturity matrix (subset of Tau)
+#   Delta_t   : weekly time step in years (= DELTA_T from Step 0)
+#   n_starts  : number of random restarts for the optimiser (= N_STARTS)
+#   block_id  : integer label for the block (used only in messages)
+#
+#############################################################################
+
+estimate_ss <- function(Y_train, Tau_train, Delta_t, n_starts, block_id) {
+
+  stopifnot(ncol(Y_train) == ncol(Tau_train))
+  stopifnot(nrow(Y_train) == nrow(Tau_train))
+  stopifnot(ncol(Y_train) >= 10L)   # need enough data to identify 2 factors
+
+  message("  [Block ", block_id, "] Starting MLE — ",
+          ncol(Y_train), " training weeks, ", n_starts, " restarts")
+
+  # ── 1. Generate random starting vectors ───────────────────────────────────
+  set.seed(42L + block_id)   # reproducible per block; different seed each block
+  init_vecs <- replicate(n_starts, pack(sample_start()), simplify = FALSE)
+
+  # ── 2. Run optimiser from each starting point ─────────────────────────────
+  fits <- purrr::map(init_vecs, function(p0) {
+    tryCatch(
+      optim(
+        par     = p0,
+        fn      = loglik,
+        Y       = Y_train,
+        Tau     = Tau_train,
+        Delta_t = Delta_t,
+        method  = "BFGS",
+        control = list(maxit = 4000L, reltol = 1e-10)
+      ),
+      error = function(e) list(value = Inf, par = p0, convergence = 99L)
+    )
+  })
+
+  # ── 3. Remove degenerate runs ──────────────────────────────────────────────
+  is_plausible <- function(fit) {
+    if (!is.finite(fit$value) || fit$value >= 1e5) return(FALSE)
+    th <- tryCatch(unpack(fit$par), error = function(e) NULL)
+    if (is.null(th)) return(FALSE)
+    th$kappa      > 0   && th$kappa      <= 50  &&
+    th$sigma_chi  > 0   && th$sigma_chi  <=  5  &&
+    th$sigma_xi   > 0   && th$sigma_xi   <=  5  &&
+    abs(th$rho)   < 0.9999                       &&
+    all(is.finite(th$sigma_obs_vec))             &&
+    all(th$sigma_obs_vec > 0)
+  }
+
+  valid <- purrr::keep(fits, is_plausible)
+
+  if (length(valid) == 0L) {
+    message("  [Block ", block_id, "] WARNING: all ", n_starts,
+            " runs degenerate, retrying with 16 tighter starts ...")
+    set.seed(42L + block_id + 1000L)
+    init_vecs_retry <- replicate(16L, pack(sample_start()), simplify = FALSE)
+    fits_retry <- purrr::map(init_vecs_retry, function(p0) {
+      tryCatch(
+        optim(par = p0, fn = loglik, Y = Y_train, Tau = Tau_train,
+              Delta_t = Delta_t, method = "BFGS",
+              control = list(maxit = 4000L, reltol = 1e-10)),
+        error = function(e) list(value = Inf, par = p0, convergence = 99L)
+      )
+    })
+    valid <- purrr::keep(fits_retry, is_plausible)
+    if (length(valid) == 0L) {
+      stop("Block ", block_id, ": estimation failed after retry. ",
+           "Check training data for this window.")
+    }
+  }
+
+  # ── 4. Select the run with the highest log-likelihood ─────────────────────
+  best <- valid[[which.min(purrr::map_dbl(valid, "value"))]]
+
+  # ── 5. Unpack to natural scale and attach metadata ─────────────────────────
+  theta_hat <- unpack(best$par)
+  class(theta_hat) <- "theta_hat"
+
+  theta_hat$loglik_converged  <- -best$value
+  theta_hat$n_valid_runs      <- length(valid)
+  theta_hat$lambda_xi_implied <- theta_hat$mu - theta_hat$mu_star
+
+  # ── Extract final filtered state from training window ──────────────────────
+  # Run one clean forward filter pass at the final theta_hat over the full
+  # training window. The December posterior is retained for the boundary
+  # signal, while FKF's one-step-ahead prediction becomes the prior for the
+  # first January observation. This is fully look-ahead free (it only uses training data).
+  ss_train   <- make_ss_arrays(theta_hat, Tau_train, Delta_t)
+  masked_train <- apply_missing_mask_fkf(Y_train, ss_train)
+  L_use      <- max(4L, min(6L, ncol(Y_train)))
+  prior_train <- tryCatch(
+    compute_prior_from_first_L(masked_train$Zt, masked_train$ct,
+                               masked_train$yt, L = L_use, inflate = 2.0),
+    error = function(e) list(m0 = c(0, 0), P0 = diag(1e6, 2))
+  )
+  kf_train <- tryCatch(
+    fkf(a0  = prior_train$m0,  P0  = prior_train$P0,
+        dt  = masked_train$dt, ct  = masked_train$ct,
+        Tt  = masked_train$Tt, Zt  = masked_train$Zt,
+        HHt = masked_train$HHt, GGt = masked_train$GGt,
+        yt  = masked_train$yt),
+    error = function(e) NULL
+  )
+  if (!is.null(kf_train) && all(is.finite(kf_train$att))) {
+    n_train <- ncol(Y_train)
+    theta_hat$att_train_end <- as.numeric(kf_train$att[,  n_train])
+    theta_hat$Ptt_train_end <- kf_train$Ptt[,, n_train]
+    theta_hat$at_trade_start <- as.numeric(kf_train$at[, n_train + 1L])
+    theta_hat$Pt_trade_start <- kf_train$Pt[, , n_train + 1L]
+    stopifnot(all(is.finite(theta_hat$at_trade_start)))
+    stopifnot(all(is.finite(theta_hat$Pt_trade_start)))
+    # Empirical SD of filtered chi over the entire training window.
+    # Used in generate_signals() as the z-score normaliser (Option B).
+    # Look-ahead free: computed entirely from training data.
+    chi_train_vec           <- as.numeric(kf_train$att[1L, ])
+    emp_sd                  <- sd(chi_train_vec, na.rm = TRUE)
+    theta_hat$sigma_chi_emp <- if (is.finite(emp_sd) && emp_sd > 0) emp_sd else NA_real_
+  } else {
+    # Fallback to diffuse prior if filter fails (safty step - should not happen)
+    warning("Block ", block_id, ": training-end filter failed, using diffuse prior")
+    theta_hat$att_train_end <- c(0, 0)
+    theta_hat$Ptt_train_end <- diag(1e6, 2)
+    theta_hat$at_trade_start <- c(0, 0)
+    theta_hat$Pt_trade_start <- diag(1e6, 2)
+    theta_hat$sigma_chi_emp <- NA_real_
+  }
+
+  message("  [Block ", block_id, "] MLE done — logLik = ",
+          round(theta_hat$loglik_converged, 2),
+          "  (", length(valid), "/", n_starts, " runs valid)")
+  message("  [Block ", block_id, "] kappa = ",   round(theta_hat$kappa,     3),
+          "  sigma_chi = ", round(theta_hat$sigma_chi, 3),
+          "  sigma_xi = ",  round(theta_hat$sigma_xi,  3),
+          "  rho = ",       round(theta_hat$rho,       3))
+  message("  [Block ", block_id, "] Training-end state: chi = ",
+          round(theta_hat$att_train_end[1], 4),
+          "  xi = ", round(theta_hat$att_train_end[2], 4))
+  message("  [Block ", block_id, "] First-trade-week prior: chi = ",
+          round(theta_hat$at_trade_start[1], 4),
+          "  xi = ", round(theta_hat$at_trade_start[2], 4))
+
+  theta_hat
+}
+
+```
+
+
+## Step 4: Forward Kalman Filter Function
+This section defines run_forward_kf(), which takes a fixed theta_hat
+from Step 3 and runs the Kalman filter forward over one trading year. It
+extracts the filtered chi and xi paths used to construct the trading
+signal in Step 5, and returns the final filtered state and covariance to
+be carried forward as the prior for the next trading year.
+
+```{r step4, message=TRUE, warning=FALSE}
+
+#############################################################################
+# STEP 4.0 — run_forward_kf(): forward Kalman filter for one trading year
+#
+# Arguments:
+#   theta_hat  : parameter list returned by estimate_ss() (Step 3)
+#   Y_trade    : 5 x n_trade log-price matrix for the trading window
+#   Tau_trade  : 5 x n_trade maturity matrix for the trading window
+#   Delta_t    : weekly time step in years (= DELTA_T from Step 0)
+#   m0_init    : 2x1 one-step-ahead prior mean for the first trading week,
+#                  obtained from at[, n_train + 1] under this year's theta.
+#   P0_init    : 2x2 one-step-ahead prior covariance for the first trading week,
+#                  obtained from Pt[,, n_train + 1] under this year's theta.
+#   block_id   : integer label used in messages only
+#
+# Returns a list:
+#   $chi_vec    : numeric vector length n_trade; filtered chi at each week
+#                 = fkf$att[1, ]; posterior mean of chi given all data up to t
+#   $xi_vec     : numeric vector length n_trade; filtered xi at each week
+#                 = fkf$att[2, ]
+#   $att_last   : numeric 2x1; filtered state at final week of trading year
+#   $Ptt_last   : numeric 2x2; filtered covariance at final week of trading year
+#   $kf         : the full fkf object (stored for diagnostics)
+#
+# Critical look-ahead bias note:
+#   att[, t] is the POSTERIOR mean E[x_t | y_1,...,y_t], it uses week t data
+#   but nothing from week t+1 onwards.
+#############################################################################
+
+run_forward_kf <- function(theta_hat, Y_trade, Tau_trade, Delta_t,
+                           m0_init, P0_init, block_id) {
+
+  stopifnot(ncol(Y_trade) == ncol(Tau_trade))
+  stopifnot(length(m0_init) == 2L)
+  stopifnot(all(dim(P0_init) == c(2L, 2L)))
+  stopifnot(all(is.finite(m0_init)))
+  stopifnot(all(is.finite(P0_init)))
+
+  n_trade <- ncol(Y_trade)
+
+  # ── 1. Build state-space arrays from fixed theta_hat ──────────────────────
+  # Uses the exact same make_ss_arrays() as the estimation code.
+  # Parameters are FIXED at theta_hat, no re-estimation here.
+  ss <- make_ss_arrays(theta_hat, Tau_trade, Delta_t)
+
+  if (any(!is.finite(ss$ct))) {
+    stop("Block ", block_id, ": make_ss_arrays() produced non-finite ct. ",
+         "Check theta_hat validity.")
+  }
+
+  # ── 2. Apply missing data mask ─────────────────────────────────────────────
+  # Identical procedure to estimation code, missing contracts are neutralised
+  # in the measurement equation and their variance is inflated to near-infinity.
+  masked <- apply_missing_mask_fkf(Y_trade, ss)
+
+  # ── 3. Run Kalman filter with the correctly timed predictive prior ─────────
+  # FKF updates the first supplied observation before applying its next state
+  # transition. Therefore a0/P0 must already describe the first trading-week
+  # state. The caller supplies at[, n_train + 1] / Pt[,, n_train + 1] from a
+  # clean training-sample refilter under the current annual theta.
+  kf <- tryCatch(
+    fkf(
+      a0  = m0_init,   P0  = P0_init,    # prior mean and covariance
+      dt  = masked$dt, ct  = masked$ct,  # state drift + measurement intercept
+      Tt  = masked$Tt, Zt  = masked$Zt,  # transition + measurement matrices
+      HHt = masked$HHt, GGt = masked$GGt,# process noise + measurement noise
+      yt  = masked$yt                    # observations (NAs replaced + masked)
+    ),
+    error = function(e) {
+      stop("Block ", block_id, ": fkf() failed during forward filter. ",
+           "Error: ", conditionMessage(e))
+    }
+  )
+
+  if (any(kf$status != 0L)) {
+    warning("Block ", block_id,
+            ": FKF LAPACK failure status: ", paste(kf$status, collapse = ", "),
+            ". Results may be unreliable for this trading year.")
+  }
+
+  # ── 4. Extract filtered state paths ───────────────────────────────────────
+  # fkf$att is the 2 x n_trade matrix of POSTERIOR filtered means.
+  # att[1, t] = E[chi_t | y_1,...,y_t]; short-term factor at week t
+  # att[2, t] = E[xi_t  | y_1,...,y_t]; long-term factor at week t
+  # This is what we use for the signal; posterior, not prior.
+  chi_vec <- as.numeric(kf$att[1L, ])   # length n_trade
+  xi_vec  <- as.numeric(kf$att[2L, ])   # length n_trade
+
+  stopifnot(length(chi_vec) == n_trade)
+  stopifnot(length(xi_vec)  == n_trade)
+
+  # ── 5. Extract final state and covariance for diagnostics ─────────────────
+  # att[, n_trade]   = filtered state at the last week of this trading year
+  # Ptt[,, n_trade]  = filtered covariance at the last week of this trading year
+  att_last <- as.numeric(kf$att[, n_trade])     # length 2
+  Ptt_last <- kf$Ptt[, , n_trade]               # 2 x 2 matrix
+
+  stopifnot(length(att_last) == 2L)
+  stopifnot(all(dim(Ptt_last) == c(2L, 2L)))
+  stopifnot(all(is.finite(att_last)))
+
+  list(
+    chi_vec  = chi_vec,
+    xi_vec   = xi_vec,
+    att_last = att_last,
+    Ptt_last = Ptt_last,
+    kf       = kf
+  )
+}
+
+```
+
+
+## Step 5: Annual Expanding-Window Estimation and Filtering
+This step is the model-estimation backbone shared with the relative-value strategy,
+but it produces only the annual parameter estimates and filtered latent states
+needed by the directional strategies. No calendar spread is constructed and no
+directional P&L is calculated here.
+
+For trading year \(y\), the model is estimated using observations from
+1990 through the final observation of year \(y-1\). The fitted parameters are
+then held fixed throughout year \(y\). The Kalman filter is forward-only:
+the posterior state at date \(t\) uses observations through \(t\), never
+future observations or smoothed states.
+
+The explicit cache is accepted only when the input files, this
+notebook, the sample dates, and the estimation settings have identical
+fingerprints. Deleting the cache simply forces a full rebuild.
+
+```{r annual-expanding-estimation, include=FALSE, cache=FALSE}
+
+MODEL_CACHE_VERSION <- "directional-final-v1-2026-10-12"
+MODEL_CACHE <- file.path(PATH_OUTPUT, "ss2000_annual_model_cache.rds")
+
+safe_md5 <- function(path) {
+  if (!file.exists(path)) return(NA_character_)
+  unname(tools::md5sum(path))
+}
+
+cache_signature <- list(
+  version = MODEL_CACHE_VERSION,
+  notebook_md5 = if (has_input_file) safe_md5(input_file) else NA_character_,
+  futures_md5 = safe_md5(PATH_FUTURES),
+  tbill_md5 = safe_md5(PATH_TBILL),
+  train_start = as.character(TRAIN_START),
+  first_trade = as.character(FIRST_TRADE),
+  final_observation = as.character(max(obs_dates)),
+  delta_t = DELTA_T,
+  n_starts = N_STARTS,
+  contracts = CONTRACTS,
+  dev_mode = DEV_MODE,
+  dev_end = as.character(DEV_END)
+)
+
+use_model_cache <- FALSE
+if (file.exists(MODEL_CACHE)) {
+  cached_model <- tryCatch(readRDS(MODEL_CACHE), error = function(e) NULL)
+  use_model_cache <- is.list(cached_model) &&
+    all(c("signature", "results_df", "theta_list", "schedule") %in%
+          names(cached_model)) &&
+    identical(cached_model$signature, cache_signature)
+}
+
+if (use_model_cache) {
+  results_df <- cached_model$results_df
+  theta_list <- cached_model$theta_list
+  schedule <- cached_model$schedule
+  message("Using validated annual-model cache: ", MODEL_CACHE)
+} else {
+  n_blocks <- nrow(schedule)
+  state_results <- vector("list", n_blocks)
+  theta_list <- vector("list", n_blocks)
+
+  message("Starting annual expanding-window estimation: ", n_blocks,
+          " trading years")
+
+  for (k in seq_len(n_blocks)) {
+    blk <- schedule[k, ]
+    train_idx <- blk$train_start_idx:blk$train_end_idx
+    trade_idx <- blk$trade_start_idx:blk$trade_end_idx
+
+    theta_hat_k <- estimate_ss(
+      Y_train = Y[, train_idx, drop = FALSE],
+      Tau_train = Tau[, train_idx, drop = FALSE],
+      Delta_t = DELTA_T,
+      n_starts = N_STARTS,
+      block_id = k
+    )
+    theta_list[[k]] <- theta_hat_k
+
+    kf_k <- run_forward_kf(
+      theta_hat = theta_hat_k,
+      Y_trade = Y[, trade_idx, drop = FALSE],
+      Tau_trade = Tau[, trade_idx, drop = FALSE],
+      Delta_t = DELTA_T,
+      m0_init = theta_hat_k$at_trade_start,
+      P0_init = theta_hat_k$Pt_trade_start,
+      block_id = k
+    )
+
+    rate_annual_pct <- dtb3[trade_idx]
+    rate_weekly <- ifelse(
+      is.finite(rate_annual_pct) & rate_annual_pct > 0,
+      (1 + rate_annual_pct / 100)^(7 / 365.25) - 1,
+      0
+    )
+
+    state_results[[k]] <- data.frame(
+      date = obs_dates[trade_idx],
+      trading_year = blk$trading_year,
+      chi = kf_k$chi_vec,
+      xi = kf_k$xi_vec,
+      tbill_rate_weekly = rate_weekly,
+      stringsAsFactors = FALSE
+    )
+
+    message("  Completed trading year ", blk$trading_year,
+            " using data through ", obs_dates[blk$train_end_idx])
+  }
+
+  results_df <- dplyr::bind_rows(state_results)
+  names(theta_list) <- as.character(schedule$trading_year)
+
+  stopifnot(nrow(results_df) == sum(schedule$n_trade_weeks))
+  stopifnot(all(is.finite(results_df$chi)))
+  stopifnot(all(is.finite(results_df$xi)))
+  stopifnot(all(is.finite(results_df$tbill_rate_weekly)))
+  stopifnot(all(schedule$train_end_idx < schedule$trade_start_idx))
+
+  saveRDS(
+    list(
+      signature = cache_signature,
+      results_df = results_df,
+      theta_list = theta_list,
+      schedule = schedule
+    ),
+    MODEL_CACHE
+  )
+}
+
+if (is.null(names(theta_list))) {
+  names(theta_list) <- as.character(schedule$trading_year)
+}
+
+stopifnot(
+  nrow(results_df) == sum(schedule$n_trade_weeks),
+  all(as.Date(results_df$date) >= FIRST_TRADE),
+  all(is.finite(results_df$chi)),
+  all(is.finite(results_df$xi)),
+  all(schedule$train_end_idx < schedule$trade_start_idx)
+)
+
+```
+
+
+## Step 6: Frozen Directional Research Design
+The hypotheses, trading universe, sample split, costs, and margin conventions
+are declared before the calibration exercise. The model-estimation panel is
+common to both strategies, but every backtest below holds only one outright
+futures maturity at a time.
+
+```{r directional-design, message=FALSE, warning=FALSE}
+
+CALIBRATION_END <- as.Date("2016-12-31")
+OOS_START       <- as.Date("2017-01-01")
+
+DIRECTIONAL_INITIAL_CAPITAL <- 1e6
+DIRECTIONAL_CONTRACT_SIZE   <- 1000L
+DIRECTIONAL_COST_PER_SIDE   <- 12.50
+
+# Maturity-specific outright margins. Construction follows the relative-value
+# methodology: conservative maintenance rounding, 110% HRP initial margin
+# rounded to the next $250, a 2x initial stress, and no arbitrary contract or
+# gross-notional ceiling. The last column is a robustness stress only.
+DIRECTIONAL_MARGIN_SCHEDULE <- data.frame(
+  contract_rank = c(1L, 2L, 3L, 5L, 9L, 13L, 17L),
+  cme_reference_date = as.Date("2025-12-26"),
+  cme_reference_long = c(4225, 4132, 3924, 3746, 3383, 3110, 2794),
+  cme_reference_short = c(3732, 3547, 3314, 3135, 2776, 2494, 2258),
+  maintenance = c(4250, 4250, 4000, 3750, 3500, 3250, 3000),
+  initial = c(4750, 4750, 4500, 4250, 4000, 3750, 3500),
+  stress_primary = c(9500, 9500, 9000, 8500, 8000, 7500, 7000),
+  historical_reference_date = as.Date("2022-03-21"),
+  historical_exchange_margin = c(12000, 10500, 9500, 7800, 6800, 6400, 5900),
+  stress_historical = c(13250, 11750, 10500, 8750, 8000, 7500, 7000),
+  stringsAsFactors = FALSE
+)
+DIRECTIONAL_MAX_STRESS_MARGIN_UTILIZATION <- 0.80
+DIRECTIONAL_TBILL_HAIRCUT <- 0.005
+
+directional_margin_terms <- function(contract_rank,
+                                     margin_scenario = c("primary", "historical")) {
+  margin_scenario <- match.arg(margin_scenario)
+  row <- DIRECTIONAL_MARGIN_SCHEDULE[
+    DIRECTIONAL_MARGIN_SCHEDULE$contract_rank == as.integer(contract_rank),
+    , drop = FALSE
+  ]
+  if (nrow(row) != 1L) stop("No outright-margin terms for CL", contract_rank)
+  list(
+    maintenance = row$maintenance,
+    initial = row$initial,
+    stress = if (margin_scenario == "primary") row$stress_primary else
+      row$stress_historical,
+    scenario = margin_scenario
+  )
+}
+
+PRIMARY_CONTRACT_RANK <- 1L
+ROBUSTNESS_CONTRACT_RANKS <- c(2L, 3L)
+
+directional_design <- data.frame(
+  Item = c(
+    "Model estimation panel", "Initial estimation", "Parameter updates",
+    "Trading sample", "Calibration/development", "Retrospective OOS",
+    "Contrarian signal", "Model-forecast signal", "Primary traded contract",
+    "Position size", "Base cost", "Outright margin", "Roll execution"
+  ),
+  Choice = c(
+    "CL1, CL5, CL9, CL13 and CL17",
+    "1990-1999",
+    "Annual expanding window",
+    "2000-2025",
+    "2000-2016",
+    "2017-2025",
+    "position = -sign(filtered chi)",
+    "position = sign(one-week SS2000 log-price forecast change)",
+    "CL1",
+    "One contract",
+    "$12.50 per one-way contract-side",
+    "Maturity-specific; 2x initial stress, 80% equity limit",
+    "Actual underlying ticker with LTD-safe pre-roll"
+  )
+)
+
+knitr::kable(
+  directional_design,
+  caption = "Frozen directional research design",
+  align = c("l", "l")
+)
+
+```
+
+
+## Step 7: Decision States and Executable Contract Paths
+The decision state for a weekly return interval is the filtered posterior
+available at the preceding weekly close. At the first observation of each
+calendar year, the relevant decision is the final December posterior produced
+by that year's newly estimated expanding-window model.
+
+```{r directional-reference, message=FALSE, warning=FALSE}
+
+directional_ref <- as.data.frame(results_df)
+directional_ref$date <- as.Date(directional_ref$date)
+
+trade_rows <- match(directional_ref$date, obs_dates)
+if (anyNA(trade_rows)) stop("Directional dates do not align with obs_dates")
+
+theta_by_year <- stats::setNames(theta_list, schedule$trading_year)
+
+is_year_start <- c(TRUE, diff(directional_ref$trading_year) != 0)
+decision_chi <- decision_xi <- rep(NA_real_, nrow(directional_ref))
+
+for (i in seq_len(nrow(directional_ref))) {
+  yr <- as.character(directional_ref$trading_year[i])
+  th <- theta_by_year[[yr]]
+  if (is.null(th)) stop("Missing annual theta for year ", yr)
+
+  if (is_year_start[i]) {
+    decision_chi[i] <- th$att_train_end[1L]
+    decision_xi[i]  <- th$att_train_end[2L]
+  } else {
+    decision_chi[i] <- directional_ref$chi[i - 1L]
+    decision_xi[i]  <- directional_ref$xi[i - 1L]
+  }
+}
+
+if (any(!is.finite(decision_chi)) || any(!is.finite(decision_xi))) {
+  stop("Decision states contain invalid values")
+}
+
+# Construct a single-leg executable path using helper functions and
+# timing convention. Each weekly change is measured on
+# one actual exchange ticker; generic-series jumps never enter P&L.
+build_single_leg_execution <- function(contract_rank) {
+  stopifnot(length(contract_rank) == 1L, contract_rank >= 1L,
+            contract_rank <= ncol(UND_ALL))
+
+  n <- nrow(directional_ref)
+  target_ticker <- rep(NA_character_, n)
+  price_prev <- price_curr <- rep(NA_real_, n)
+  ltd_curr <- as.Date(rep(NA_real_, n), origin = "1970-01-01")
+  exec_roll <- logical(n)
+
+  held_ticker <- NA_character_
+
+  for (i in seq_len(n)) {
+    idx_now  <- trade_rows[i]
+    idx_prev <- idx_now - 1L
+    if (idx_prev < 1L) stop("No prior observation for directional execution")
+
+    row_prev_px  <- PX_ALL[idx_prev,  , drop = TRUE]
+    row_prev_und <- UND_ALL[idx_prev, , drop = TRUE]
+    row_prev_ltd <- LTD_ALL[idx_prev, , drop = TRUE]
+    row_curr_px  <- PX_ALL[idx_now,   , drop = TRUE]
+    row_curr_und <- UND_ALL[idx_now,  , drop = TRUE]
+    row_curr_ltd <- LTD_ALL[idx_now,  , drop = TRUE]
+
+    generic_next <- UND_ALL[idx_now, contract_rank]
+    previous_ticker <- held_ticker
+
+    held_ticker <- choose_execution_ticker(
+      held_ticker         = held_ticker,
+      generic_ticker_next = generic_next,
+      prev_und_row        = row_prev_und,
+      prev_ltd_row        = row_prev_ltd,
+      next_obs_date       = directional_ref$date[i]
+    )
+
+    px0 <- lookup_ticker_price(row_prev_px, row_prev_und, held_ticker)
+    px1 <- lookup_ticker_price(row_curr_px, row_curr_und, held_ticker)
+    ltd <- lookup_ticker_ltd(row_curr_ltd, row_curr_und, held_ticker)
+
+    if (!is.finite(px0) || !is.finite(px1) || px0 <= 0 || px1 <= 0) {
+      stop("Invalid executable price for ", held_ticker, " on ",
+           directional_ref$date[i])
+    }
+
+    target_ticker[i] <- held_ticker
+    price_prev[i] <- px0
+    price_curr[i] <- px1
+    ltd_curr[i] <- ltd
+    exec_roll[i] <- i > 1L && !is.na(previous_ticker) &&
+      previous_ticker != held_ticker
+  }
+
+  data.frame(
+    date = directional_ref$date,
+    contract_rank = contract_rank,
+    target_ticker = target_ticker,
+    price_prev = price_prev,
+    price_curr = price_curr,
+    ltd_curr = ltd_curr,
+    exec_roll = exec_roll,
+    unit_long_gross = (price_curr - price_prev) * DIRECTIONAL_CONTRACT_SIZE,
+    realized_log_change = log(price_curr / price_prev),
+    stringsAsFactors = FALSE
+  )
+}
+
+execution_CL1 <- build_single_leg_execution(1L)
+
+```
+
+
+## Step 8: Directional Signal Definitions
+The **Short-Term-Deviation Contrarian Strategy** tests the direct mapping from
+the filtered short-term deviation to the opposite outright position. The
+**One-Week Model-Forecast Strategy** propagates both latent factors one week
+under the physical transition equation and reprices the actual held contract
+at its next-week maturity. The forecast is a conditional mean of log price: it
+never uses the realized next-week price.
+
+```{r directional-signals, message=FALSE, warning=FALSE}
+
+fill_zero_signal <- function(x) {
+  x <- as.integer(sign(x))
+  for (i in seq_along(x)) {
+    if (x[i] == 0L && i > 1L) x[i] <- x[i - 1L]
+  }
+  x
+}
+
+position_deviation <- fill_zero_signal(-decision_chi)
+
+forecast_log_price  <- rep(NA_real_, nrow(directional_ref))
+forecast_log_change <- rep(NA_real_, nrow(directional_ref))
+
+for (i in seq_len(nrow(directional_ref))) {
+  yr <- as.character(directional_ref$trading_year[i])
+  th <- theta_by_year[[yr]]
+
+  chi_next <- exp(-th$kappa * DELTA_T) * decision_chi[i]
+  xi_next  <- decision_xi[i] + th$mu * DELTA_T
+
+  tau_next <- as.numeric(execution_CL1$ltd_curr[i] - directional_ref$date[i]) /
+    365.25
+  tau_next <- max(tau_next, 0)
+
+  forecast_log_price[i] <-
+    exp(-th$kappa * tau_next) * chi_next + xi_next +
+    A_fun(
+      tau_next, th$kappa, th$mu_star, th$sigma_chi,
+      th$sigma_xi, th$rho, th$lambda_chi
+    )
+
+  forecast_log_change[i] <-
+    forecast_log_price[i] - log(execution_CL1$price_prev[i])
+}
+
+if (any(!is.finite(forecast_log_change))) {
+  stop("The one-week model-forecast signal contains invalid values")
+}
+
+position_forecast <- fill_zero_signal(forecast_log_change)
+
+signal_frame <- data.frame(
+  date = directional_ref$date,
+  trading_year = directional_ref$trading_year,
+  decision_chi = decision_chi,
+  decision_xi = decision_xi,
+  position_deviation = position_deviation,
+  forecast_log_price = forecast_log_price,
+  forecast_log_change = forecast_log_change,
+  position_forecast = position_forecast,
+  realized_log_change = execution_CL1$realized_log_change,
+  signals_agree = position_deviation == position_forecast
+)
+
+signal_diagnostics <- data.frame(
+  Metric = c(
+    "Weeks", "Signal agreement", "Contrarian long share",
+    "Contrarian short share", "Model-forecast long share",
+    "Model-forecast short share", "CL1 execution rolls"
+  ),
+  Value = c(
+    nrow(signal_frame),
+    mean(signal_frame$signals_agree),
+    mean(signal_frame$position_deviation == 1L),
+    mean(signal_frame$position_deviation == -1L),
+    mean(signal_frame$position_forecast == 1L),
+    mean(signal_frame$position_forecast == -1L),
+    sum(execution_CL1$exec_roll)
+  )
+)
+
+knitr::kable(signal_diagnostics, digits = 4,
+             caption = "Pre-specified signal diagnostics")
+
+```
+
+
+## Step 9: One-Contract Baseline P&L
+The simulator requests exactly one contract when active and then checks that
+position against the maturity-specific stressed-margin capacity. Costs are
+charged for entries, exits, reversals, rolls and terminal liquidation. A roll
+plus a reversal requires closing the old ticker and opening the new ticker,
+which is two contract-sides rather than four.
+
+```{r directional-pnl-engine, message=FALSE, warning=FALSE}
+
+simulate_directional <- function(execution, position, strategy_id,
+                                 cost_per_side = DIRECTIONAL_COST_PER_SIDE,
+                                 initial_capital = DIRECTIONAL_INITIAL_CAPITAL,
+                                 margin_scenario = c("primary", "historical")) {
+  margin_scenario <- match.arg(margin_scenario)
+  n <- nrow(execution)
+  stopifnot(length(position) == n)
+  stopifnot(all(position %in% c(-1L, 0L, 1L)))
+  stopifnot(cost_per_side >= 0)
+  rank <- unique(execution$contract_rank)
+  if (length(rank) != 1L) stop("Each directional simulation must use one maturity")
+  margin <- directional_margin_terms(rank, margin_scenario)
+
+  gross <- costs <- net <- tbill_pnl <- total_pnl <- capital <- numeric(n)
+  capital_start_week <- numeric(n)
+  margin_posted <- maintenance_required <- stress_required <- numeric(n)
+  stress_limit <- stress_util_start <- stress_util_end <- numeric(n)
+  margin_face_value <- idle_cash <- numeric(n)
+  contracts <- margin_capacity <- integer(n)
+  signed_quantity <- integer(n)
+  margin_cap_binding <- maintenance_margin_call <- logical(n)
+  contract_sides <- integer(n)
+  trade_event <- rep("none", n)
+  roll_event <- logical(n)
+  capital_running <- initial_capital
+
+  for (i in seq_len(n)) {
+    pos_now  <- position[i]
+    q_prev <- if (i == 1L) 0L else signed_quantity[i - 1L]
+    ticker_now  <- execution$target_ticker[i]
+    ticker_prev <- if (i == 1L) NA_character_ else execution$target_ticker[i - 1L]
+    ticker_changed <- i > 1L && !is.na(ticker_prev) && ticker_prev != ticker_now
+    capital_start_week[i] <- capital_running
+
+    margin_capacity[i] <- max(0L, as.integer(floor(
+      DIRECTIONAL_MAX_STRESS_MARGIN_UTILIZATION * max(capital_running, 0) /
+        margin$stress
+    )))
+    desired_contracts <- abs(pos_now)
+    contracts[i] <- min(desired_contracts, margin_capacity[i])
+    margin_cap_binding[i] <- desired_contracts > margin_capacity[i]
+    q_now <- pos_now * contracts[i]
+    signed_quantity[i] <- q_now
+
+    sides_i <- if (ticker_changed && (q_prev != 0L || q_now != 0L)) {
+      abs(q_prev) + abs(q_now)
+    } else {
+      abs(q_now - q_prev)
+    }
+
+    # Charge terminal liquidation after the final weekly P&L.
+    if (i == n && q_now != 0L) sides_i <- sides_i + abs(q_now)
+
+    event_i <- dplyr::case_when(
+      q_prev == 0L && q_now != 0L ~ "entry",
+      q_prev != 0L && q_now == 0L ~ "exit",
+      q_prev * q_now < 0L && ticker_changed ~ "roll_and_reversal",
+      q_prev * q_now < 0L ~ "reversal",
+      ticker_changed && q_now != 0L ~ "roll",
+      TRUE ~ "none"
+    )
+    if (i == n && q_now != 0L) {
+      event_i <- if (event_i == "none") "terminal_liquidation" else
+        paste0(event_i, "+terminal_liquidation")
+    }
+
+    gross[i] <- q_now * execution$unit_long_gross[i]
+    costs[i] <- sides_i * cost_per_side
+    net[i] <- gross[i] - costs[i]
+
+    margin_posted[i] <- margin$initial * contracts[i]
+    maintenance_required[i] <- margin$maintenance * contracts[i]
+    stress_required[i] <- margin$stress * contracts[i]
+    stress_limit[i] <- DIRECTIONAL_MAX_STRESS_MARGIN_UTILIZATION * capital_running
+    stress_util_start[i] <- if (capital_running > 0) {
+      stress_required[i] / capital_running
+    } else if (stress_required[i] > 0) Inf else 0
+    margin_face_value[i] <- margin_posted[i] / (1 - DIRECTIONAL_TBILL_HAIRCUT)
+    idle_cash[i] <- capital_running - margin_posted[i]
+    if (idle_cash[i] < -1e-8 || stress_required[i] > stress_limit[i] + 1e-8) {
+      stop("Directional margin invariant failed on ", execution$date[i])
+    }
+
+    # As in the RV account, only cash not posted as margin earns DTB3.
+    weekly_rate <- directional_ref$tbill_rate_weekly[i]
+    if (!is.finite(weekly_rate)) weekly_rate <- 0
+    tbill_pnl[i] <- idle_cash[i] * weekly_rate
+    total_pnl[i] <- net[i] + tbill_pnl[i]
+    capital_running <- capital_running + total_pnl[i]
+    capital[i] <- capital_running
+    maintenance_margin_call[i] <- contracts[i] > 0L &&
+      capital_running < maintenance_required[i]
+    stress_util_end[i] <- if (capital_running > 0) {
+      stress_required[i] / capital_running
+    } else if (stress_required[i] > 0) Inf else 0
+
+    contract_sides[i] <- sides_i
+    trade_event[i] <- event_i
+    roll_event[i] <- ticker_changed && q_now != 0L && q_prev != 0L
+  }
+
+  data.frame(
+    strategy_id = strategy_id,
+    date = execution$date,
+    trading_year = directional_ref$trading_year,
+    target_ticker = execution$target_ticker,
+    price_prev = execution$price_prev,
+    price_curr = execution$price_curr,
+    position = position,
+    contracts = contracts,
+    signed_quantity = signed_quantity,
+    unit_long_gross = execution$unit_long_gross,
+    gross_futures_pnl = gross,
+    contract_sides_traded = contract_sides,
+    transaction_cost = costs,
+    net_futures_pnl = net,
+    margin_scenario = margin_scenario,
+    margin_per_contract_initial = margin$initial,
+    margin_per_contract_maintenance = margin$maintenance,
+    margin_per_contract_stress = margin$stress,
+    margin_posted = margin_posted,
+    maintenance_margin_required = maintenance_required,
+    stress_margin_required = stress_required,
+    stress_margin_limit = stress_limit,
+    stress_margin_utilization_start = stress_util_start,
+    stress_margin_utilization_end = stress_util_end,
+    margin_face_value = margin_face_value,
+    idle_cash = idle_cash,
+    margin_capacity_contracts = margin_capacity,
+    margin_cap_binding = margin_cap_binding,
+    maintenance_margin_call = maintenance_margin_call,
+    capital_start_week = capital_start_week,
+    tbill_rate_weekly = directional_ref$tbill_rate_weekly,
+    tbill_pnl = tbill_pnl,
+    total_pnl = total_pnl,
+    capital = capital,
+    exec_roll = roll_event,
+    trade_event = trade_event,
+    stringsAsFactors = FALSE
+  )
+}
+
+weekly_deviation <- simulate_directional(execution_CL1, position_deviation, "DEV_CONTRARIAN_CL1")
+weekly_forecast <- simulate_directional(execution_CL1, position_forecast, "MODEL_FORECAST_CL1")
+weekly_long <- simulate_directional(
+  execution_CL1, rep(1L, nrow(directional_ref)), "Always_Long"
+)
+weekly_short <- simulate_directional(
+  execution_CL1, rep(-1L, nrow(directional_ref)), "Always_Short"
+)
+
+# Attach the decision variables needed for transparent weekly exports.
+weekly_deviation$decision_chi <- decision_chi
+weekly_deviation$decision_xi <- decision_xi
+weekly_deviation$forecast_log_change <- forecast_log_change
+weekly_deviation$realized_log_change <- execution_CL1$realized_log_change
+
+weekly_forecast$decision_chi <- decision_chi
+weekly_forecast$decision_xi <- decision_xi
+weekly_forecast$forecast_log_change <- forecast_log_change
+weekly_forecast$realized_log_change <- execution_CL1$realized_log_change
+
+```
+
+
+## Step 10: Baseline Performance and Predictive Evidence
+Futures performance is evaluated separately from passive T-bill income. The
+information ratio uses weekly net futures P&L divided by start-of-week account
+equity, while drawdown uses the net-futures equity path. Collateral returns
+therefore cannot mask a weak trading signal.
+
+```{r directional-summaries, message=FALSE, warning=FALSE}
+
+period_definitions <- data.frame(
+  period = c(
+    "Calibration 2000-2016",
+    "Retrospective OOS 2017-2025",
+    "Full 2000-2025"
+  ),
+  start = as.Date(c("2000-01-01", "2017-01-01", "2000-01-01")),
+  end = as.Date(c("2016-12-31", "2025-12-31", "2025-12-31"))
+)
+
+max_futures_drawdown_pct <- function(pnl, base_capital) {
+  wealth <- base_capital + cumsum(pnl)
+  peak <- cummax(c(base_capital, wealth))[-1L]
+  min((wealth - peak) / peak) * 100
+}
+
+summarize_directional_period <- function(x, period_name, start_date, end_date) {
+  y <- x[x$date >= start_date & x$date <= end_date, , drop = FALSE]
+  if (nrow(y) == 0L) stop("Empty period: ", period_name)
+
+  weekly_futures_return <- y$net_futures_pnl / y$capital_start_week
+  return_sd <- stats::sd(weekly_futures_return)
+  info_ratio <- if (is.finite(return_sd) && return_sd > 0) {
+    sqrt(52) * mean(weekly_futures_return) / return_sd
+  } else NA_real_
+
+  starts <- c(TRUE, y$position[-1L] != y$position[-nrow(y)])
+
+  data.frame(
+    strategy_id = unique(y$strategy_id),
+    period = period_name,
+    start_date = min(y$date),
+    end_date = max(y$date),
+    weeks = nrow(y),
+    gross_futures_pnl = sum(y$gross_futures_pnl),
+    transaction_cost = sum(y$transaction_cost),
+    net_futures_pnl = sum(y$net_futures_pnl),
+    information_ratio = info_ratio,
+    max_futures_drawdown_pct = max_futures_drawdown_pct(
+      y$net_futures_pnl, y$capital_start_week[1L]
+    ),
+    long_weeks = sum(y$position == 1L),
+    short_weeks = sum(y$position == -1L),
+    flat_weeks = sum(y$position == 0L),
+    position_episodes = sum(starts & y$position != 0L),
+    contract_sides_traded = sum(y$contract_sides_traded),
+    roll_weeks = sum(y$exec_roll),
+    tbill_pnl = sum(y$tbill_pnl),
+    ending_capital = tail(y$capital, 1L),
+    stringsAsFactors = FALSE
+  )
+}
+
+all_weekly_strategies <- list(weekly_deviation, weekly_forecast, weekly_long, weekly_short)
+
+period_summary <- dplyr::bind_rows(lapply(all_weekly_strategies, function(x) {
+  dplyr::bind_rows(lapply(seq_len(nrow(period_definitions)), function(i) {
+    summarize_directional_period(
+      x,
+      period_definitions$period[i],
+      period_definitions$start[i],
+      period_definitions$end[i]
+    )
+  }))
+}))
+
+primary_period_summary <- period_summary[
+  period_summary$strategy_id %in% c("DEV_CONTRARIAN_CL1", "MODEL_FORECAST_CL1"),
+]
+
+knitr::kable(
+  primary_period_summary %>%
+    dplyr::select(
+      strategy_id, period, gross_futures_pnl, transaction_cost,
+      net_futures_pnl, information_ratio, max_futures_drawdown_pct,
+      long_weeks, short_weeks, position_episodes
+    ),
+  digits = 3,
+  caption = "Primary and secondary directional results"
+)
+
+# Long/short attribution uses weekly position rather than trade episodes so the
+# total reconciles exactly to net futures P&L.
+long_short_attribution <- dplyr::bind_rows(lapply(
+  list(DEV_CONTRARIAN_CL1 = weekly_deviation, MODEL_FORECAST_CL1 = weekly_forecast),
+  function(x) {
+    x %>%
+      dplyr::mutate(direction = dplyr::case_when(
+        position == 1L ~ "Long",
+        position == -1L ~ "Short",
+        TRUE ~ "Flat"
+      )) %>%
+      dplyr::group_by(strategy_id, direction) %>%
+      dplyr::summarise(
+        weeks = dplyr::n(),
+        gross_futures_pnl = sum(gross_futures_pnl),
+        transaction_cost = sum(transaction_cost),
+        net_futures_pnl = sum(net_futures_pnl),
+        .groups = "drop"
+      )
+  }
+))
+
+knitr::kable(long_short_attribution, digits = 2,
+             caption = "Long and short weekly attribution")
+
+# Newey-West/HAC covariance for a compact predictive regression. Lag four is
+# fixed in advance and is not selected from the result.
+fit_hac_regression <- function(y, x, lag = 4L, label = "Full") {
+  keep <- is.finite(y) & is.finite(x)
+  y <- as.numeric(y[keep])
+  x <- as.numeric(x[keep])
+  X <- cbind(`(Intercept)` = 1, decision_chi = x)
+  n <- nrow(X)
+  k <- ncol(X)
+  beta <- solve(crossprod(X), crossprod(X, y))
+  u <- as.numeric(y - X %*% beta)
+
+  meat <- matrix(0, k, k)
+  for (t in seq_len(n)) {
+    xt <- matrix(X[t, ], ncol = 1)
+    meat <- meat + u[t]^2 * (xt %*% t(xt))
+  }
+  if (lag > 0L) {
+    for (ell in seq_len(lag)) {
+      weight <- 1 - ell / (lag + 1)
+      gamma <- matrix(0, k, k)
+      for (t in (ell + 1L):n) {
+        xt <- matrix(X[t, ], ncol = 1)
+        xl <- matrix(X[t - ell, ], ncol = 1)
+        gamma <- gamma + u[t] * u[t - ell] * (xt %*% t(xl))
+      }
+      meat <- meat + weight * (gamma + t(gamma))
+    }
+  }
+
+  bread <- solve(crossprod(X))
+  vcov_hac <- (n / (n - k)) * bread %*% meat %*% bread
+  se <- sqrt(diag(vcov_hac))
+  t_stat <- beta / se
+  p_two_sided <- 2 * stats::pnorm(-abs(t_stat))
+
+  data.frame(
+    period = label,
+    observations = n,
+    intercept = beta[1L],
+    intercept_hac_se = se[1L],
+    beta_chi = beta[2L],
+    beta_chi_hac_se = se[2L],
+    beta_chi_t = t_stat[2L],
+    beta_chi_p_two_sided = p_two_sided[2L],
+    hac_lag = lag
+  )
+}
+
+predictive_regression <- dplyr::bind_rows(lapply(seq_len(nrow(period_definitions)), function(i) {
+  use <- signal_frame$date >= period_definitions$start[i] &
+    signal_frame$date <= period_definitions$end[i]
+  fit_hac_regression(
+    signal_frame$realized_log_change[use],
+    signal_frame$decision_chi[use],
+    lag = 4L,
+    label = period_definitions$period[i]
+  )
+}))
+
+knitr::kable(predictive_regression, digits = 6,
+             caption = "Predictive regression of weekly CL1 log changes on filtered chi")
+
+forecast_diagnostics <- dplyr::bind_rows(lapply(seq_len(nrow(period_definitions)), function(i) {
+  use <- signal_frame$date >= period_definitions$start[i] &
+    signal_frame$date <= period_definitions$end[i]
+  y <- signal_frame$realized_log_change[use]
+  f <- signal_frame$forecast_log_change[use]
+  data.frame(
+    period = period_definitions$period[i],
+    observations = sum(use),
+    mean_forecast = mean(f),
+    mean_realized = mean(y),
+    mean_forecast_error = mean(y - f),
+    rmse = sqrt(mean((y - f)^2)),
+    sign_accuracy = mean(sign(f) == sign(y)),
+    A_B_agreement = mean(signal_frame$signals_agree[use])
+  )
+}))
+
+knitr::kable(forecast_diagnostics, digits = 5,
+             caption = "Secondary one-week forecast diagnostics")
+
+```
+
+
+## Step 11: Baseline Benchmarks and Maturity Robustness
+CL2 and CL3 are predefined maturity checks rather than candidates from which an
+optimized strategy may be selected. Cost sensitivity changes only the one-way dollar cost;
+the signal, timing and contract path remain fixed.
+
+```{r directional-robustness, message=FALSE, warning=FALSE}
+
+benchmark_summary <- period_summary[
+  period_summary$strategy_id %in% c("Always_Long", "Always_Short"),
+]
+
+knitr::kable(
+  benchmark_summary %>%
+    dplyr::select(strategy_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_futures_drawdown_pct),
+  digits = 3,
+  caption = "Unconditional directional benchmarks"
+)
+
+execution_CL2 <- build_single_leg_execution(2L)
+execution_CL3 <- build_single_leg_execution(3L)
+
+weekly_deviation_CL2 <- simulate_directional(execution_CL2, position_deviation, "DEV_CONTRARIAN_CL2")
+weekly_deviation_CL3 <- simulate_directional(execution_CL3, position_deviation, "DEV_CONTRARIAN_CL3")
+
+maturity_robustness <- dplyr::bind_rows(lapply(
+  list(CL1 = weekly_deviation, CL2 = weekly_deviation_CL2, CL3 = weekly_deviation_CL3),
+  function(x) {
+    dplyr::bind_rows(lapply(seq_len(nrow(period_definitions)), function(i) {
+      summarize_directional_period(
+        x,
+        period_definitions$period[i],
+        period_definitions$start[i],
+        period_definitions$end[i]
+      )
+    }))
+  }
+))
+
+knitr::kable(
+  maturity_robustness %>%
+    dplyr::select(strategy_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_futures_drawdown_pct),
+  digits = 3,
+  caption = "Predefined nearby-maturity robustness for the contrarian strategy"
+)
+
+cost_design <- data.frame(
+  scenario = c("Low", "Base", "Stress"),
+  cost_per_side = c(7.50, DIRECTIONAL_COST_PER_SIDE, 22.50)
+)
+
+cost_sensitivity <- dplyr::bind_rows(lapply(seq_len(nrow(cost_design)), function(i) {
+  run <- simulate_directional(
+    execution_CL1, position_deviation,
+    paste0("DEV_CONTRARIAN_CL1_", cost_design$scenario[i]),
+    cost_per_side = cost_design$cost_per_side[i]
+  )
+  out <- dplyr::bind_rows(lapply(seq_len(nrow(period_definitions)), function(j) {
+    summarize_directional_period(
+      run,
+      period_definitions$period[j],
+      period_definitions$start[j],
+      period_definitions$end[j]
+    )
+  }))
+  out$scenario <- cost_design$scenario[i]
+  out$cost_per_side <- cost_design$cost_per_side[i]
+  out
+}))
+
+knitr::kable(
+  cost_sensitivity %>%
+    dplyr::select(scenario, cost_per_side, period, transaction_cost,
+                  net_futures_pnl, information_ratio),
+  digits = 3,
+  caption = "Primary-signal transaction-cost sensitivity"
+)
+
+```
+
+
+## Step 12: Baseline Performance Through Time
+
+```{r directional-performance-plots, fig.width=10, fig.height=5, message=FALSE, warning=FALSE}
+
+plot_data <- dplyr::bind_rows(
+  weekly_deviation %>%
+    dplyr::mutate(strategy = "Short-Term-Deviation Contrarian"),
+  weekly_forecast %>%
+    dplyr::mutate(strategy = "One-Week Model Forecast"),
+  weekly_long %>% dplyr::mutate(strategy = "Always long")
+) %>%
+  dplyr::group_by(strategy) %>%
+  dplyr::arrange(date, .by_group = TRUE) %>%
+  dplyr::mutate(cumulative_net_futures_pnl = cumsum(net_futures_pnl)) %>%
+  dplyr::ungroup()
+
+ggplot(plot_data, aes(date, cumulative_net_futures_pnl, colour = strategy)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = OOS_START, linetype = "dashed", colour = "#2E2E2E") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    title = "Cumulative net futures P&L",
+    subtitle = "Dashed line marks the start of the retrospective OOS period",
+    x = NULL, y = "Net futures P&L", colour = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+
+```
+
+```{r directional-signal-plot, fig.width=10, fig.height=5, message=FALSE, warning=FALSE}
+
+ggplot(signal_frame, aes(date, decision_chi, colour = factor(position_deviation))) +
+  geom_hline(yintercept = 0, colour = "#2E2E2E") +
+  geom_line(linewidth = 0.55) +
+  geom_vline(xintercept = OOS_START, linetype = "dashed", colour = "#2E2E2E") +
+  scale_colour_manual(
+    values = c(`-1` = "#B2182B", `0` = "#777777", `1` = "#2166AC"),
+    labels = c(`-1` = "Short", `0` = "Flat", `1` = "Long")
+  ) +
+  labs(
+    title = "Real-time decision chi and primary position",
+    subtitle = "Filtered states only; the signal controls the following weekly interval",
+    x = NULL, y = "Decision chi", colour = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+
+```
+
+```{r directional-annual-results, message=FALSE, warning=FALSE}
+
+annual_results <- dplyr::bind_rows(
+  weekly_deviation,
+  weekly_forecast
+) %>%
+  dplyr::group_by(strategy_id, trading_year) %>%
+  dplyr::summarise(
+    gross_futures_pnl = sum(gross_futures_pnl),
+    transaction_cost = sum(transaction_cost),
+    net_futures_pnl = sum(net_futures_pnl),
+    long_weeks = sum(position == 1L),
+    short_weeks = sum(position == -1L),
+    contract_sides_traded = sum(contract_sides_traded),
+    .groups = "drop"
+  )
+
+knitr::kable(annual_results, digits = 2,
+             caption = "Annual directional strategy results")
+
+```
+
+
+## Step 13: Baseline Checks and Intermediate Outputs
+
+```{r directional-checks-and-exports, message=FALSE, warning=FALSE}
+
+reconstruct_gross_deviation <- weekly_deviation$signed_quantity *
+  (execution_CL1$price_curr - execution_CL1$price_prev) *
+  DIRECTIONAL_CONTRACT_SIZE
+
+expected_deviation_position <- fill_zero_signal(-decision_chi)
+
+implementation_checks <- data.frame(
+  Check = c(
+    "Annual training ends before each trading year",
+    "Decision states are finite",
+    "Contrarian position equals the declared negative-chi rule",
+    "Contrarian gross P&L reconstructs exactly",
+    "Net P&L equals gross less costs",
+    "No negative transaction costs",
+    "Posted margin follows the CL1 outright schedule",
+    "Stressed margin remains within 80% of start-of-week equity",
+    "Every active roll trades two contract-sides absent another boundary event",
+    "Terminal liquidation is charged",
+    "Calibration and OOS dates do not overlap"
+  ),
+  Passed = c(
+    all(schedule$train_end_idx < schedule$trade_start_idx),
+    all(is.finite(decision_chi)) && all(is.finite(decision_xi)),
+    identical(position_deviation, expected_deviation_position),
+    max(abs(reconstruct_gross_deviation - weekly_deviation$gross_futures_pnl)) <= 1e-10,
+    max(abs(weekly_deviation$gross_futures_pnl - weekly_deviation$transaction_cost -
+              weekly_deviation$net_futures_pnl)) <= 1e-10,
+    all(weekly_deviation$transaction_cost >= 0) && all(weekly_forecast$transaction_cost >= 0),
+    all(weekly_deviation$margin_posted ==
+          weekly_deviation$contracts * weekly_deviation$margin_per_contract_initial),
+    all(weekly_deviation$stress_margin_required <=
+          weekly_deviation$stress_margin_limit + 1e-8),
+    all(weekly_deviation$contract_sides_traded[weekly_deviation$trade_event == "roll"] == 2L),
+    grepl("terminal_liquidation", tail(weekly_deviation$trade_event, 1L)),
+    CALIBRATION_END < OOS_START
+  )
+)
+
+if (!all(implementation_checks$Passed)) {
+  print(implementation_checks)
+  stop("One or more directional implementation checks failed")
+}
+
+knitr::kable(implementation_checks,
+             caption = "Directional implementation checks")
+
+dir.create(PATH_OUTPUT, showWarnings = FALSE, recursive = TRUE)
+
+write.csv(directional_design,
+          file.path(PATH_OUTPUT, "01_fixed_research_design.csv"), row.names = FALSE)
+write.csv(signal_diagnostics,
+          file.path(PATH_OUTPUT, "02_signal_diagnostics.csv"), row.names = FALSE)
+write.csv(predictive_regression,
+          file.path(PATH_OUTPUT, "03_predictive_regression.csv"), row.names = FALSE)
+write.csv(period_summary,
+          file.path(PATH_OUTPUT, "04_all_period_summaries.csv"), row.names = FALSE)
+write.csv(long_short_attribution,
+          file.path(PATH_OUTPUT, "05_long_short_attribution.csv"), row.names = FALSE)
+write.csv(annual_results,
+          file.path(PATH_OUTPUT, "06_annual_results.csv"), row.names = FALSE)
+write.csv(weekly_deviation,
+          file.path(PATH_OUTPUT, "07_weekly_deviation_contrarian_CL1.csv"), row.names = FALSE)
+write.csv(weekly_forecast,
+          file.path(PATH_OUTPUT, "08_weekly_model_forecast_CL1.csv"), row.names = FALSE)
+write.csv(benchmark_summary,
+          file.path(PATH_OUTPUT, "09_benchmark_summary.csv"), row.names = FALSE)
+write.csv(maturity_robustness,
+          file.path(PATH_OUTPUT, "10_maturity_robustness.csv"), row.names = FALSE)
+write.csv(cost_sensitivity,
+          file.path(PATH_OUTPUT, "11_cost_sensitivity.csv"), row.names = FALSE)
+write.csv(forecast_diagnostics,
+          file.path(PATH_OUTPUT, "12_forecast_diagnostics.csv"), row.names = FALSE)
+write.csv(implementation_checks,
+          file.path(PATH_OUTPUT, "13_implementation_checks.csv"), row.names = FALSE)
+write.csv(DIRECTIONAL_MARGIN_SCHEDULE,
+          file.path(PATH_OUTPUT, "14_outright_margin_schedule.csv"), row.names = FALSE)
+
+saveRDS(
+  list(
+    design = directional_design,
+    margin_schedule = DIRECTIONAL_MARGIN_SCHEDULE,
+    annual_parameter_estimates = theta_list,
+    schedule = schedule,
+    signal_frame = signal_frame,
+    execution = list(CL1 = execution_CL1, CL2 = execution_CL2, CL3 = execution_CL3),
+    weekly = list(
+      deviation_contrarian_CL1 = weekly_deviation,
+      model_forecast_CL1 = weekly_forecast,
+      always_long = weekly_long,
+      always_short = weekly_short,
+      deviation_contrarian_CL2 = weekly_deviation_CL2,
+      deviation_contrarian_CL3 = weekly_deviation_CL3
+    ),
+    summaries = list(
+      periods = period_summary,
+      annual = annual_results,
+      long_short = long_short_attribution,
+      predictive_regression = predictive_regression,
+      forecast_diagnostics = forecast_diagnostics,
+      maturity_robustness = maturity_robustness,
+      cost_sensitivity = cost_sensitivity
+    ),
+    checks = implementation_checks,
+    session_info = utils::sessionInfo()
+  ),
+  file.path(PATH_OUTPUT, "15_baseline_results.rds")
+)
+
+capture.output(
+  utils::sessionInfo(),
+  file = file.path(PATH_OUTPUT, "sessionInfo.txt")
+)
+
+```
+
+
+## Step 14: Calibration-Only Timing and Sizing Research
+
+The calibration is carried out entirely within this notebook. It has no
+access to future observations when forming annual signal normalizers. Outright
+sizing volatility is initialized with executable history from 1990 and is
+strictly lagged, so the January 2000 position uses only 1990--1999 returns.
+
+```{r optimization-engine, message=TRUE, warning=FALSE}
+#############################################################################
+# 14.0 Frozen research choices
+#############################################################################
+
+OPT_CAL_END <- as.Date("2016-12-31")
+OPT_OOS_START <- as.Date("2017-01-01")
+OPT_INITIAL_CAPITAL <- 1e6
+OPT_RISK_SCALE <- 0.20 / sqrt(52)
+OPT_MIN_CONTRACTS <- 1L
+OPT_MIN_TRADES <- 15L
+
+# Outright performance-bond framework. The construction is the same as the RV 
+# strategy: maintenance is conservatively rounded, HRP initial margin is 110%
+# of maintenance rounded to the next $250, and the primary capacity constraint
+# uses twice initial margin with at most 80% of start-of-week equity committed
+# under stress. Margin limits feasibility only; it is not an alpha or sizing
+# target. The historical-stress column is a frozen robustness scenario and is
+# never used to select a strategy specification.
+OPT_MARGIN_SCHEDULE <- data.frame(
+  contract_rank = c(1L, 2L, 3L, 5L, 9L, 13L, 17L),
+  cme_reference_date = as.Date("2025-12-26"),
+  cme_reference_long = c(4225, 4132, 3924, 3746, 3383, 3110, 2794),
+  cme_reference_short = c(3732, 3547, 3314, 3135, 2776, 2494, 2258),
+  maintenance = c(4250, 4250, 4000, 3750, 3500, 3250, 3000),
+  initial = c(4750, 4750, 4500, 4250, 4000, 3750, 3500),
+  stress_primary = c(9500, 9500, 9000, 8500, 8000, 7500, 7000),
+  historical_reference_date = as.Date("2022-03-21"),
+  historical_exchange_margin = c(12000, 10500, 9500, 7800, 6800, 6400, 5900),
+  stress_historical = c(13250, 11750, 10500, 8750, 8000, 7500, 7000),
+  stringsAsFactors = FALSE
+)
+OPT_MAX_STRESS_MARGIN_UTILIZATION <- 0.80
+OPT_TBILL_HAIRCUT <- 0.005
+
+margin_terms <- function(contract_rank,
+                         margin_scenario = c("primary", "historical")) {
+  margin_scenario <- match.arg(margin_scenario)
+  row <- OPT_MARGIN_SCHEDULE[
+    OPT_MARGIN_SCHEDULE$contract_rank == as.integer(contract_rank), , drop = FALSE
+  ]
+  if (nrow(row) != 1L) stop("No outright-margin terms for CL", contract_rank)
+  list(
+    maintenance = row$maintenance,
+    initial = row$initial,
+    stress = if (margin_scenario == "primary") row$stress_primary else
+      row$stress_historical,
+    scenario = margin_scenario
+  )
+}
+
+MODEL_FORECAST_RANKS <- c(1L, 5L, 9L, 13L, 17L)
+DEVIATION_ROBUSTNESS_RANKS <- c(2L, 3L)
+OPT_COSTS <- c(`1` = 12.50, `2` = 12.50, `3` = 12.50,
+               `5` = 15.00, `9` = 17.50, `13` = 20.00, `17` = 22.50)
+
+entry_grid <- c(0.50, 1.00, 1.50, 2.00)
+exit_grid <- c(0.00, 0.50, 1.00)
+time_stop_grid <- c(Inf, 26, 52)
+broad_grid <- expand.grid(entry = entry_grid, exit = exit_grid,
+                          time_stop = time_stop_grid) |>
+  dplyr::filter(exit < entry) |>
+  dplyr::arrange(time_stop, entry, exit)
+stopifnot(nrow(broad_grid) == 27L)
+
+sizing_design <- data.frame(
+  sizing_mode = c("fixed_entry", "fixed_entry", "fixed_entry", "weekly_resize"),
+  ema_half_life = c(26L, 13L, 52L, 26L),
+  research_role = c("primary", "half-life sensitivity", "half-life sensitivity",
+                    "resizing sensitivity"),
+  stringsAsFactors = FALSE
+)
+
+#############################################################################
+# 2. General execution, filtering, signal and sizing helpers
+#############################################################################
+
+build_execution_for_indices <- function(contract_rank, current_indices,
+                                        output_dates = obs_dates[current_indices]) {
+  current_indices <- as.integer(current_indices)
+  if (!length(current_indices) || any(current_indices <= 1L)) {
+    stop("Execution indices must contain at least one interval with a prior week")
+  }
+  n <- length(current_indices)
+  target_ticker <- rep(NA_character_, n)
+  price_prev <- price_curr <- rep(NA_real_, n)
+  ltd_curr <- as.Date(rep(NA_real_, n), origin = "1970-01-01")
+  exec_roll <- logical(n)
+  held_ticker <- NA_character_
+
+  for (i in seq_len(n)) {
+    idx_now <- current_indices[i]
+    idx_prev <- idx_now - 1L
+    prev_px <- PX_ALL[idx_prev, , drop = TRUE]
+    prev_und <- UND_ALL[idx_prev, , drop = TRUE]
+    prev_ltd <- LTD_ALL[idx_prev, , drop = TRUE]
+    curr_px <- PX_ALL[idx_now, , drop = TRUE]
+    curr_und <- UND_ALL[idx_now, , drop = TRUE]
+    curr_ltd <- LTD_ALL[idx_now, , drop = TRUE]
+    old_ticker <- held_ticker
+
+    held_ticker <- choose_execution_ticker(
+      held_ticker = held_ticker,
+      generic_ticker_next = UND_ALL[idx_now, contract_rank],
+      prev_und_row = prev_und,
+      prev_ltd_row = prev_ltd,
+      next_obs_date = obs_dates[idx_now]
+    )
+    p0 <- lookup_ticker_price(prev_px, prev_und, held_ticker)
+    p1 <- lookup_ticker_price(curr_px, curr_und, held_ticker)
+    ltd <- lookup_ticker_ltd(curr_ltd, curr_und, held_ticker)
+    if (!is.finite(p0) || !is.finite(p1) || p0 <= 0 || p1 <= 0) {
+      stop("Invalid executable price for rank ", contract_rank,
+           " on ", obs_dates[idx_now])
+    }
+    target_ticker[i] <- held_ticker
+    price_prev[i] <- p0
+    price_curr[i] <- p1
+    ltd_curr[i] <- ltd
+    exec_roll[i] <- i > 1L && !is.na(old_ticker) && old_ticker != held_ticker
+  }
+
+  data.frame(
+    date = as.Date(output_dates), contract_rank = contract_rank,
+    target_ticker = target_ticker, price_prev = price_prev,
+    price_curr = price_curr, ltd_curr = ltd_curr, exec_roll = exec_roll,
+    unit_long_gross = (price_curr - price_prev) * DIRECTIONAL_CONTRACT_SIZE,
+    realized_log_change = log(price_curr / price_prev),
+    stringsAsFactors = FALSE
+  )
+}
+
+filter_training_states <- function(theta, end_idx) {
+  idx <- seq_len(end_idx)
+  ss <- make_ss_arrays(theta, Tau[, idx, drop = FALSE], DELTA_T)
+  masked <- apply_missing_mask_fkf(Y[, idx, drop = FALSE], ss)
+  prior <- tryCatch(
+    compute_prior_from_first_L(masked$Zt, masked$ct, masked$yt,
+                               L = max(4L, min(6L, length(idx))), inflate = 2.0),
+    error = function(e) list(m0 = c(0, 0), P0 = diag(1e6, 2))
+  )
+  fit <- FKF::fkf(a0 = prior$m0, P0 = prior$P0,
+                  dt = masked$dt, ct = masked$ct,
+                  Tt = masked$Tt, Zt = masked$Zt,
+                  HHt = masked$HHt, GGt = masked$GGt, yt = masked$yt)
+  fit$att
+}
+
+forecast_gap_from_state <- function(theta, chi, xi, execution, i) {
+  chi_next <- exp(-theta$kappa * DELTA_T) * chi
+  xi_next <- xi + theta$mu * DELTA_T
+  tau_next <- max(as.numeric(execution$ltd_curr[i] - execution$date[i]) / 365.25, 0)
+  predicted <- exp(-theta$kappa * tau_next) * chi_next + xi_next +
+    A_fun(tau_next, theta$kappa, theta$mu_star, theta$sigma_chi,
+          theta$sigma_xi, theta$rho, theta$lambda_chi)
+  predicted - log(execution$price_prev[i])
+}
+
+lagged_ema_sd <- function(x, half_life) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  if (length(x) < 2L) return(out)
+  lambda <- exp(log(0.5) / half_life)
+  weight_sum <- weighted_sum <- weighted_square_sum <- 0
+  n_seen <- 0L
+  for (i in seq_along(x)) {
+    if (n_seen >= 2L && weight_sum > 0) {
+      mu <- weighted_sum / weight_sum
+      variance <- max(weighted_square_sum / weight_sum - mu^2, 0)
+      out[i] <- sqrt(variance)
+    }
+    if (is.finite(x[i])) {
+      weight_sum <- lambda * weight_sum + 1
+      weighted_sum <- lambda * weighted_sum + x[i]
+      weighted_square_sum <- lambda * weighted_square_sum + x[i]^2
+      n_seen <- n_seen + 1L
+    }
+  }
+  out
+}
+
+threshold_positions <- function(score, entry, exit, time_stop) {
+  if (!(entry > exit && exit >= 0)) stop("Thresholds require entry > exit >= 0")
+  n <- length(score)
+  position <- integer(n)
+  current <- 0L
+  held_weeks <- 0L
+  for (i in seq_len(n)) {
+    s <- score[i]
+    if (!is.finite(s)) {
+      position[i] <- current
+      next
+    }
+    if (current == 0L) {
+      if (s >= entry) current <- 1L
+      if (s <= -entry) current <- -1L
+      held_weeks <- if (current == 0L) 0L else 1L
+    } else {
+      time_exit <- is.finite(time_stop) && held_weeks >= time_stop
+      convergence_exit <- abs(s) <= exit
+      reverse_to <- if (s >= entry) 1L else if (s <= -entry) -1L else 0L
+      if (time_exit || convergence_exit) {
+        current <- 0L
+        held_weeks <- 0L
+      } else if (reverse_to != 0L && reverse_to != current) {
+        current <- reverse_to
+        held_weeks <- 1L
+      } else {
+        held_weeks <- held_weeks + 1L
+      }
+    }
+    position[i] <- current
+  }
+  position
+}
+
+count_trade_entries <- function(position) {
+  prev <- c(0L, head(position, -1L))
+  sum(position != 0L & position != prev)
+}
+
+simulate_outright <- function(execution, position, cost_per_side,
+                              sizing_mode = c("unit", "fixed_entry", "weekly_resize"),
+                              ema_half_life = 26L, strategy_id = "candidate",
+                              add_terminal_liquidation = TRUE,
+                              margin_scenario = c("primary", "historical")) {
+  sizing_mode <- match.arg(sizing_mode)
+  margin_scenario <- match.arg(margin_scenario)
+  n <- nrow(execution)
+  stopifnot(length(position) == n, all(position %in% c(-1L, 0L, 1L)))
+  rank <- unique(execution$contract_rank)
+  if (length(rank) != 1L) stop("Each outright simulation must use one maturity")
+  margin <- margin_terms(rank, margin_scenario)
+  vol_history <- sizing_volatility_by_rank[[as.character(rank)]]
+  vol_column <- paste0("ema_sd_", as.integer(ema_half_life))
+  if (is.null(vol_history) || !vol_column %in% names(vol_history)) {
+    stop("Missing strictly historical sizing volatility for CL", rank,
+         " and half-life ", ema_half_life)
+  }
+  vol_match <- match(execution$date, vol_history$date)
+  if (anyNA(vol_match)) {
+    stop("Sizing-volatility history does not cover every execution date for CL", rank)
+  }
+  vol <- vol_history[[vol_column]][vol_match]
+  if (any(!is.finite(vol) | vol <= 0)) {
+    stop("Strictly lagged sizing volatility is invalid for CL", rank)
+  }
+  signed_quantity <- integer(n)
+  contracts <- desired_contracts <- margin_capacity <- integer(n)
+  sides <- integer(n)
+  gross <- costs <- net <- tbill_pnl <- total <- capital <- numeric(n)
+  capital_start <- numeric(n)
+  margin_posted <- maintenance_required <- stress_required <- numeric(n)
+  stress_limit <- stress_util_start <- stress_util_end <- numeric(n)
+  margin_face_value <- idle_cash <- gross_notional <- numeric(n)
+  margin_cap_binding <- margin_entry_cap <- margin_forced_reduction <- logical(n)
+  maintenance_margin_call <- logical(n)
+  margin_action <- rep("none", n)
+  capital_running <- OPT_INITIAL_CAPITAL
+  current_contracts <- 0L
+
+  for (i in seq_len(n)) {
+    pos_now <- position[i]
+    pos_prev <- if (i == 1L) 0L else position[i - 1L]
+    q_prev <- if (i == 1L) 0L else signed_quantity[i - 1L]
+    is_new_trade <- pos_now != 0L &&
+      (pos_prev == 0L || pos_prev != pos_now || current_contracts == 0L)
+    capital_start[i] <- capital_running
+
+    if (pos_now == 0L) {
+      current_contracts <- 0L
+    } else if (sizing_mode == "unit") {
+      current_contracts <- 1L
+    } else if (is_new_trade || sizing_mode == "weekly_resize") {
+      sd_i <- vol[i]
+      raw_n <- round((OPT_RISK_SCALE * capital_running) / sd_i)
+      current_contracts <- max(OPT_MIN_CONTRACTS, as.integer(raw_n))
+    }
+
+    # Match the RV ordering: determine the desired risk-sized position first,
+    # then allow the stressed-margin rule only to reduce it. There is no fixed
+    # contract ceiling and no gross-notional-to-equity ceiling.
+    desired_i <- if (pos_now == 0L) 0L else current_contracts
+    capacity_i <- max(0L, as.integer(floor(
+      OPT_MAX_STRESS_MARGIN_UTILIZATION * max(capital_running, 0) / margin$stress
+    )))
+    feasible_i <- min(desired_i, capacity_i)
+    binding_i <- desired_i > capacity_i
+    margin_cap_binding[i] <- binding_i
+    margin_entry_cap[i] <- is_new_trade && binding_i
+    margin_forced_reduction[i] <- !is_new_trade && binding_i
+    if (binding_i) {
+      margin_action[i] <- if (is_new_trade && feasible_i == 0L) {
+        "entry_blocked"
+      } else if (is_new_trade) {
+        "entry_capped"
+      } else if (feasible_i == 0L) {
+        "forced_flat"
+      } else {
+        "forced_reduction"
+      }
+    }
+    desired_contracts[i] <- desired_i
+    margin_capacity[i] <- capacity_i
+    current_contracts <- feasible_i
+    contracts[i] <- current_contracts
+    q_now <- pos_now * current_contracts
+    signed_quantity[i] <- q_now
+
+    ticker_changed <- i > 1L && execution$target_ticker[i] != execution$target_ticker[i - 1L]
+    sides[i] <- if (ticker_changed && (q_prev != 0L || q_now != 0L)) {
+      abs(q_prev) + abs(q_now)
+    } else {
+      abs(q_now - q_prev)
+    }
+    if (i == n && add_terminal_liquidation) sides[i] <- sides[i] + abs(q_now)
+
+    gross[i] <- q_now * execution$unit_long_gross[i]
+    costs[i] <- sides[i] * cost_per_side
+    net[i] <- gross[i] - costs[i]
+    margin_posted[i] <- margin$initial * current_contracts
+    maintenance_required[i] <- margin$maintenance * current_contracts
+    stress_required[i] <- margin$stress * current_contracts
+    stress_limit[i] <- OPT_MAX_STRESS_MARGIN_UTILIZATION * capital_running
+    stress_util_start[i] <- if (capital_running > 0) {
+      stress_required[i] / capital_running
+    } else if (stress_required[i] > 0) Inf else 0
+    margin_face_value[i] <- margin_posted[i] / (1 - OPT_TBILL_HAIRCUT)
+    idle_cash[i] <- capital_running - margin_posted[i]
+    if (idle_cash[i] < -1e-8 || stress_required[i] > stress_limit[i] + 1e-8) {
+      stop("Outright margin invariant failed for ", strategy_id,
+           " on ", execution$date[i])
+    }
+    weekly_rate <- directional_ref$tbill_rate_weekly[
+      match(execution$date[i], directional_ref$date)
+    ]
+    if (!length(weekly_rate) || !is.finite(weekly_rate)) weekly_rate <- 0
+    tbill_pnl[i] <- idle_cash[i] * weekly_rate
+    total[i] <- net[i] + tbill_pnl[i]
+    capital_running <- capital_running + total[i]
+    capital[i] <- capital_running
+    maintenance_margin_call[i] <- current_contracts > 0L &&
+      capital_running < maintenance_required[i]
+    stress_util_end[i] <- if (capital_running > 0) {
+      stress_required[i] / capital_running
+    } else if (stress_required[i] > 0) Inf else 0
+    gross_notional[i] <- abs(q_now) * execution$price_prev[i] *
+      DIRECTIONAL_CONTRACT_SIZE
+  }
+
+  data.frame(
+    strategy_id = strategy_id, date = execution$date,
+    contract_rank = execution$contract_rank,
+    target_ticker = execution$target_ticker,
+    price_prev = execution$price_prev, price_curr = execution$price_curr,
+    direction = position, contracts = contracts,
+    signed_quantity = signed_quantity, lagged_ema_dollar_sd = vol,
+    unit_long_gross = execution$unit_long_gross,
+    gross_futures_pnl = gross, contract_sides_traded = sides,
+    transaction_cost = costs, net_futures_pnl = net,
+    margin_scenario = margin_scenario,
+    margin_per_contract_initial = margin$initial,
+    margin_per_contract_maintenance = margin$maintenance,
+    margin_per_contract_stress = margin$stress,
+    margin_posted = margin_posted,
+    maintenance_margin_required = maintenance_required,
+    stress_margin_required = stress_required,
+    stress_margin_limit = stress_limit,
+    stress_margin_utilization_start = stress_util_start,
+    stress_margin_utilization_end = stress_util_end,
+    margin_face_value = margin_face_value,
+    idle_cash = idle_cash,
+    capital_start_week = capital_start, tbill_pnl = tbill_pnl,
+    total_pnl = total, capital = capital,
+    exec_roll = execution$exec_roll & signed_quantity != 0L,
+    desired_contracts_before_margin = desired_contracts,
+    margin_capacity_contracts = margin_capacity,
+    margin_cap_binding = margin_cap_binding,
+    margin_entry_cap = margin_entry_cap,
+    margin_forced_reduction = margin_forced_reduction,
+    margin_action = margin_action,
+    maintenance_margin_call = maintenance_margin_call,
+    gross_notional = gross_notional,
+    stringsAsFactors = FALSE
+  )
+}
+
+summarise_run <- function(run, position) {
+  x <- run$net_futures_pnl
+  weekly_return <- x / run$capital_start_week
+  period_start_capital <- run$capital_start_week[1L]
+  eq <- period_start_capital + cumsum(x)
+  peak <- cummax(c(period_start_capital, eq))[-1L]
+  dd <- eq - peak
+  data.frame(
+    gross_futures_pnl = sum(run$gross_futures_pnl),
+    transaction_cost = sum(run$transaction_cost),
+    net_futures_pnl = sum(x),
+    information_ratio = if (stats::sd(weekly_return) > 0) {
+      mean(weekly_return) / stats::sd(weekly_return) * sqrt(52)
+    } else NA_real_,
+    max_drawdown_dollars = min(dd),
+    max_drawdown_pct = 100 * min(dd / peak),
+    completed_trades = count_trade_entries(position),
+    contract_sides = sum(run$contract_sides_traded),
+    max_contracts = max(run$contracts),
+    margin_cap_bindings = sum(run$margin_cap_binding),
+    margin_entry_caps = sum(run$margin_entry_cap),
+    margin_forced_reductions = sum(run$margin_forced_reduction),
+    maximum_stress_margin_utilization = max(run$stress_margin_utilization_start),
+    maximum_gross_notional_to_equity = max(run$gross_notional /
+                                             run$capital_start_week),
+    stringsAsFactors = FALSE
+  )
+}
+
+#############################################################################
+# 3. Build all live execution paths and correctly normalized signals
+#############################################################################
+
+trade_indices <- match(directional_ref$date, obs_dates)
+if (anyNA(trade_indices)) stop("Directional trading dates do not align with obs_dates")
+all_optimized_ranks <- sort(unique(c(MODEL_FORECAST_RANKS, DEVIATION_ROBUSTNESS_RANKS)))
+execution_by_rank <- stats::setNames(
+  lapply(all_optimized_ranks,
+         function(r) build_execution_for_indices(r, trade_indices, directional_ref$date)),
+  all_optimized_ranks
+)
+
+# Match the RV information convention: sizing history begins with the first
+# executable interval in the 1990 estimation sample and is carried continuously
+# through the final trading date. The EMA value attached to date t is computed
+# before adding the return ending on t, so every volatility estimate uses only
+# information available through t-1. No future-return fallback is permitted.
+sizing_history_indices <- 2L:max(trade_indices)
+sizing_execution_history_by_rank <- stats::setNames(
+  lapply(all_optimized_ranks, function(r) {
+    build_execution_for_indices(
+      r, sizing_history_indices, obs_dates[sizing_history_indices]
+    )
+  }),
+  all_optimized_ranks
+)
+sizing_half_lives <- sort(unique(as.integer(sizing_design$ema_half_life)))
+sizing_volatility_by_rank <- lapply(sizing_execution_history_by_rank, function(execution) {
+  out <- data.frame(date = execution$date)
+  for (half_life in sizing_half_lives) {
+    out[[paste0("ema_sd_", half_life)]] <- lagged_ema_sd(
+      execution$unit_long_gross, half_life
+    )
+  }
+  out
+})
+
+for (rank in all_optimized_ranks) {
+  history <- sizing_execution_history_by_rank[[as.character(rank)]]
+  live <- execution_by_rank[[as.character(rank)]]
+  live_match <- match(live$date, history$date)
+  if (anyNA(live_match) ||
+      any(history$target_ticker[live_match] != live$target_ticker) ||
+      max(abs(history$price_prev[live_match] - live$price_prev)) > 1e-10 ||
+      max(abs(history$price_curr[live_match] - live$price_curr)) > 1e-10) {
+    stop("Continuous sizing history does not reproduce the live CL", rank,
+         " execution path")
+  }
+}
+
+sizing_initialization_audit <- dplyr::bind_rows(lapply(all_optimized_ranks, function(rank) {
+  history <- sizing_execution_history_by_rank[[as.character(rank)]]
+  volatility <- sizing_volatility_by_rank[[as.character(rank)]]
+  first_trade_date <- min(execution_by_rank[[as.character(rank)]]$date)
+  first_trade_row <- match(first_trade_date, volatility$date)
+  data.frame(
+    contract_rank = rank,
+    sizing_history_start = min(history$date),
+    first_trade_date = first_trade_date,
+    observations_before_first_trade = sum(history$date < first_trade_date),
+    ema_sd_13_at_first_trade = volatility$ema_sd_13[first_trade_row],
+    ema_sd_26_at_first_trade = volatility$ema_sd_26[first_trade_row],
+    ema_sd_52_at_first_trade = volatility$ema_sd_52[first_trade_row],
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Check the generalized helper against the frozen CL1 path.
+stopifnot(max(abs(execution_by_rank[["1"]]$price_prev - execution_CL1$price_prev)) < 1e-10)
+stopifnot(max(abs(execution_by_rank[["1"]]$price_curr - execution_CL1$price_curr)) < 1e-10)
+
+# Contrarian score: exact RV convention--empirical training-sample SD of
+# filtered chi, with
+# the theoretical stationary SD only as a fallback. The oriented score is
+# positive for a desired long position.
+z_deviation <- rep(NA_real_, nrow(directional_ref))
+normalizer_deviation <- rep(NA_real_, nrow(directional_ref))
+for (i in seq_len(nrow(directional_ref))) {
+  th <- theta_by_year[[as.character(directional_ref$trading_year[i])]]
+  empirical <- th$sigma_chi_emp
+  theoretical <- th$sigma_chi / sqrt(2 * th$kappa)
+  scale_i <- if (is.finite(empirical) && empirical > 0) empirical else theoretical
+  normalizer_deviation[i] <- scale_i
+  z_deviation[i] <- -decision_chi[i] / scale_i
+}
+stopifnot(all(is.finite(z_deviation)))
+
+# Model-forecast score: for each annual model and each traded maturity, compute
+# the empirical SD
+# of historical one-week forecast gaps using only that year's training sample.
+# This retains zero as the economic no-change boundary: the gaps are scaled,
+# not demeaned. The annual normalizers are then frozen throughout the next year.
+forecast_normalizers <- list()
+forecast_training_gap_cache <- list()
+max_training_end <- max(schedule$train_end_idx)
+# Every annual training window starts in 1990, so the executable ticker path
+# up to a given boundary is a prefix of one common path. Build that path once
+# per maturity; annual estimation still refilters states separately.
+training_execution_by_rank <- stats::setNames(
+  lapply(MODEL_FORECAST_RANKS, function(rank) {
+    build_execution_for_indices(rank, 2:max_training_end,
+                                obs_dates[2:max_training_end])
+  }),
+  MODEL_FORECAST_RANKS
+)
+for (k in seq_len(nrow(schedule))) {
+  yr <- schedule$trading_year[k]
+  end_idx <- schedule$train_end_idx[k]
+  th <- theta_list[[k]]
+  states <- filter_training_states(th, end_idx)
+  interval_idx <- 2:end_idx
+  for (rank in MODEL_FORECAST_RANKS) {
+    ex_train <- training_execution_by_rank[[as.character(rank)]][
+      seq_len(length(interval_idx)), , drop = FALSE
+    ]
+    gaps <- vapply(seq_len(nrow(ex_train)), function(j) {
+      forecast_gap_from_state(th, states[1L, j], states[2L, j], ex_train, j)
+    }, numeric(1))
+    gap_sd <- stats::sd(gaps, na.rm = TRUE)
+    if (!is.finite(gap_sd) || gap_sd <= 0) stop("Invalid model-forecast training SD for ", yr, " CL", rank)
+    key <- paste(yr, rank, sep = "_")
+    forecast_training_gap_cache[[key]] <- gaps
+    forecast_normalizers[[length(forecast_normalizers) + 1L]] <- data.frame(
+      trading_year = yr, contract_rank = rank,
+      training_start = min(obs_dates[interval_idx]),
+      training_end = max(obs_dates[interval_idx]),
+      n_training_gaps = length(gaps), forecast_gap_sd = gap_sd
+    )
+  }
+}
+forecast_normalizers <- dplyr::bind_rows(forecast_normalizers)
+
+forecast_signal_rows <- list()
+for (rank in MODEL_FORECAST_RANKS) {
+  execution <- execution_by_rank[[as.character(rank)]]
+  raw_gap <- z <- rep(NA_real_, nrow(directional_ref))
+  for (i in seq_len(nrow(directional_ref))) {
+    yr <- directional_ref$trading_year[i]
+    th <- theta_by_year[[as.character(yr)]]
+    raw_gap[i] <- forecast_gap_from_state(th, decision_chi[i], decision_xi[i], execution, i)
+    scale_i <- forecast_normalizers$forecast_gap_sd[
+      forecast_normalizers$trading_year == yr & forecast_normalizers$contract_rank == rank
+    ]
+    if (length(scale_i) != 1L) stop("Missing model-forecast normalizer for ", yr, " CL", rank)
+    z[i] <- raw_gap[i] / scale_i
+  }
+  forecast_signal_rows[[as.character(rank)]] <- data.frame(
+    date = directional_ref$date, trading_year = directional_ref$trading_year,
+    contract_rank = rank, raw_forecast_gap = raw_gap,
+    z_model_forecast = z, realized_log_change = execution$realized_log_change
+  )
+}
+forecast_signals <- dplyr::bind_rows(forecast_signal_rows)
+stopifnot(all(is.finite(forecast_signals$z_model_forecast)))
+
+# Raw one-contract baselines use only the economic sign of each signal. They
+# contain no entry threshold, exit threshold, time stop, or risk scaling. The
+# contrarian signal is applied to CL1 and the pre-specified CL2/CL3 robustness
+# contracts; the model-forecast signal is reported for all five model
+# maturities. These runs are descriptive baselines and never enter selection.
+raw_baseline_runs <- list()
+raw_deviation_position <- fill_zero_signal(z_deviation)
+for (rank in c(1L, DEVIATION_ROBUSTNESS_RANKS)) {
+  id <- paste0("RAW_DEV_CONTRARIAN_CL", rank)
+  execution <- execution_by_rank[[as.character(rank)]]
+  raw_baseline_runs[[id]] <- list(
+    position = raw_deviation_position,
+    weekly = simulate_outright(
+      execution, raw_deviation_position, OPT_COSTS[[as.character(rank)]],
+      "unit", 26L, id, add_terminal_liquidation = TRUE
+    )
+  )
+}
+for (rank in MODEL_FORECAST_RANKS) {
+  id <- paste0("RAW_MODEL_FORECAST_CL", rank)
+  execution <- execution_by_rank[[as.character(rank)]]
+  raw_position <- fill_zero_signal(
+    forecast_signal_rows[[as.character(rank)]]$z_model_forecast
+  )
+  raw_baseline_runs[[id]] <- list(
+    position = raw_position,
+    weekly = simulate_outright(
+      execution, raw_position, OPT_COSTS[[as.character(rank)]],
+      "unit", 26L, id, add_terminal_liquidation = TRUE
+    )
+  )
+}
+
+#############################################################################
+# 4. Calibration-only timing and sizing searches
+#############################################################################
+
+run_one_candidate <- function(score, execution, cost, entry, exit, time_stop,
+                              sizing_mode = "unit", ema_half_life = 26L,
+                              strategy_id = "candidate") {
+  pos <- threshold_positions(score, entry, exit, time_stop)
+  run <- simulate_outright(execution, pos, cost, sizing_mode, ema_half_life,
+                           strategy_id, add_terminal_liquidation = TRUE)
+  list(position = pos, weekly = run, summary = summarise_run(run, pos))
+}
+
+timing_search <- function(strategy_id, score_full, execution_full, cost) {
+  cal <- execution_full$date <= OPT_CAL_END
+  score <- score_full[cal]
+  execution <- execution_full[cal, , drop = FALSE]
+
+  broad_rows <- lapply(seq_len(nrow(broad_grid)), function(i) {
+    g <- broad_grid[i, ]
+    out <- run_one_candidate(score, execution, cost, g$entry, g$exit,
+                             g$time_stop, "unit", 26L,
+                             paste0(strategy_id, "_broad_", i))
+    cbind(strategy_id = strategy_id, candidate_id = i,
+          entry = g$entry, exit = g$exit,
+          time_stop = if (is.infinite(g$time_stop)) "none" else as.character(g$time_stop),
+          out$summary)
+  })
+  broad <- dplyr::bind_rows(broad_rows)
+  broad$eligible <- broad$completed_trades >= OPT_MIN_TRADES
+  pool <- broad[broad$eligible, , drop = FALSE]
+  if (!nrow(pool)) stop("No timing rule has at least ", OPT_MIN_TRADES, " trades: ", strategy_id)
+  pool <- pool[order(-pool$net_futures_pnl), , drop = FALSE]
+  centre <- pool[1L, , drop = FALSE]
+
+  local_grid <- expand.grid(
+    entry = sort(unique(c(centre$entry - 0.25, centre$entry, centre$entry + 0.25))),
+    exit = sort(unique(c(centre$exit - 0.25, centre$exit, centre$exit + 0.25))),
+    time_stop = time_stop_grid
+  ) |>
+    dplyr::filter(entry > 0, exit >= 0, exit < entry) |>
+    dplyr::arrange(time_stop, entry, exit)
+  local_rows <- lapply(seq_len(nrow(local_grid)), function(i) {
+    g <- local_grid[i, ]
+    out <- run_one_candidate(score, execution, cost, g$entry, g$exit,
+                             g$time_stop, "unit", 26L,
+                             paste0(strategy_id, "_local_", i))
+    cbind(strategy_id = strategy_id, local_id = i,
+          entry = g$entry, exit = g$exit,
+          time_stop = if (is.infinite(g$time_stop)) "none" else as.character(g$time_stop),
+          out$summary)
+  })
+  local <- dplyr::bind_rows(local_rows)
+
+  # The broad-leading entry/exit pair is fixed. All three time stops proceed
+  # to sizing, so time-stop selection cannot import information from local cells.
+  sizing_rows <- list()
+  row_id <- 0L
+  for (stop_value in time_stop_grid) {
+    for (j in seq_len(nrow(sizing_design))) {
+      row_id <- row_id + 1L
+      out <- run_one_candidate(
+        score, execution, cost, centre$entry, centre$exit, stop_value,
+        sizing_design$sizing_mode[j], sizing_design$ema_half_life[j],
+        paste0(strategy_id, "_sizing_", row_id)
+      )
+      sizing_rows[[row_id]] <- cbind(
+        strategy_id = strategy_id,
+        entry = centre$entry, exit = centre$exit,
+        time_stop = if (is.infinite(stop_value)) "none" else as.character(stop_value),
+        sizing_mode = sizing_design$sizing_mode[j],
+        ema_half_life = sizing_design$ema_half_life[j],
+        research_role = sizing_design$research_role[j],
+        out$summary
+      )
+    }
+  }
+  sizing <- dplyr::bind_rows(sizing_rows)
+  primary <- sizing[sizing$research_role == "primary" &
+                      sizing$completed_trades >= OPT_MIN_TRADES, , drop = FALSE]
+  if (!nrow(primary)) stop("No eligible primary sizing implementation: ", strategy_id)
+  profitable <- primary[primary$net_futures_pnl > 0, , drop = FALSE]
+  selection_pool <- if (nrow(profitable)) profitable else primary
+  selection_pool <- selection_pool[order(-selection_pool$net_futures_pnl), , drop = FALSE]
+  frozen <- selection_pool[1L, , drop = FALSE]
+  frozen$positive_calibration_required_fallback <- !nrow(profitable)
+
+  list(broad = broad, local = local, sizing = sizing, frozen = frozen)
+}
+
+searches <- list()
+searches[["DEV_CONTRARIAN_CL1"]] <- timing_search(
+  "DEV_CONTRARIAN_CL1", z_deviation, execution_by_rank[["1"]], OPT_COSTS[["1"]]
+)
+for (rank in MODEL_FORECAST_RANKS) {
+  forecast_rank <- forecast_signal_rows[[as.character(rank)]]
+  searches[[paste0("MODEL_FORECAST_CL", rank)]] <- timing_search(
+    paste0("MODEL_FORECAST_CL", rank), forecast_rank$z_model_forecast,
+    execution_by_rank[[as.character(rank)]], OPT_COSTS[[as.character(rank)]]
+  )
+}
+
+broad_results <- dplyr::bind_rows(lapply(searches, `[[`, "broad"))
+local_results <- dplyr::bind_rows(lapply(searches, `[[`, "local"))
+sizing_results <- dplyr::bind_rows(lapply(searches, `[[`, "sizing"))
+frozen_specs <- dplyr::bind_rows(lapply(searches, `[[`, "frozen"))
+
+#############################################################################
+# 5. Apply frozen rules once to the complete history
+#############################################################################
+
+parse_stop <- function(x) if (identical(as.character(x), "none")) Inf else as.numeric(x)
+
+run_frozen <- function(spec, score, execution, cost, label,
+                       margin_scenario = "primary") {
+  pos <- threshold_positions(score, spec$entry, spec$exit, parse_stop(spec$time_stop))
+  weekly <- simulate_outright(
+    execution, pos, cost, spec$sizing_mode, spec$ema_half_life,
+    label, add_terminal_liquidation = TRUE,
+    margin_scenario = margin_scenario
+  )
+  weekly$signal_score <- score
+  list(position = pos, weekly = weekly)
+}
+
+frozen_runs <- list()
+spec_deviation <- frozen_specs[frozen_specs$strategy_id == "DEV_CONTRARIAN_CL1", , drop = FALSE]
+frozen_runs[["DEV_CONTRARIAN_CL1"]] <- run_frozen(
+  spec_deviation, z_deviation, execution_by_rank[["1"]], OPT_COSTS[["1"]], "DEV_CONTRARIAN_CL1"
+)
+
+# Contrarian maturity robustness: exact CL1 timing and sizing-rule parameters; only the
+# executable contract and its own strictly lagged dollar-volatility path change.
+for (rank in DEVIATION_ROBUSTNESS_RANKS) {
+  frozen_runs[[paste0("DEV_CONTRARIAN_CL", rank)]] <- run_frozen(
+    spec_deviation, z_deviation, execution_by_rank[[as.character(rank)]],
+    OPT_COSTS[[as.character(rank)]], paste0("DEV_CONTRARIAN_CL", rank, "_robustness")
+  )
+}
+
+for (rank in MODEL_FORECAST_RANKS) {
+  id <- paste0("MODEL_FORECAST_CL", rank)
+  spec <- frozen_specs[frozen_specs$strategy_id == id, , drop = FALSE]
+  frozen_runs[[id]] <- run_frozen(
+    spec, forecast_signal_rows[[as.character(rank)]]$z_model_forecast,
+    execution_by_rank[[as.character(rank)]], OPT_COSTS[[as.character(rank)]], id
+  )
+}
+
+weekly_frozen <- dplyr::bind_rows(lapply(frozen_runs, `[[`, "weekly"), .id = "run_id")
+
+period_labels <- function(dates) dplyr::case_when(
+  dates <= OPT_CAL_END ~ "Calibration 2000-2016",
+  dates >= OPT_OOS_START ~ "Retrospective OOS 2017-2025",
+  TRUE ~ NA_character_
+)
+
+summarise_period <- function(run_id, weekly, period_name, idx) {
+  x <- weekly[idx, , drop = FALSE]
+  if (!nrow(x)) return(NULL)
+  pnl <- x$net_futures_pnl
+  weekly_return <- pnl / x$capital_start_week
+  period_start_capital <- x$capital_start_week[1L]
+  eq <- period_start_capital + cumsum(pnl)
+  peak <- cummax(c(period_start_capital, eq))[-1L]
+  drawdown <- eq - peak
+  drawdown_flag <- drawdown < 0
+  drawdown_runs <- rle(drawdown_flag)
+  maximum_drawdown_duration <- if (any(drawdown_runs$values)) {
+    max(drawdown_runs$lengths[drawdown_runs$values])
+  } else 0L
+  active <- x$direction != 0L
+  positive_active_share <- if (any(active)) mean(pnl[active] > 0) else NA_real_
+  gross_profit <- sum(pnl[pnl > 0])
+  gross_loss <- abs(sum(pnl[pnl < 0]))
+  account_return <- x$total_pnl / x$capital_start_week
+  risk_free_return <- directional_ref$tbill_rate_weekly[
+    match(x$date, directional_ref$date)
+  ]
+  account_excess_return <- account_return - risk_free_return
+  account_peak <- cummax(
+    c(period_start_capital, x$capital)
+  )[-1L]
+  account_drawdown <- x$capital - account_peak
+  period_years <- nrow(x) / 52
+  data.frame(
+    run_id = run_id, period = period_name,
+    start_date = min(x$date), end_date = max(x$date), weeks = nrow(x),
+    start_capital = period_start_capital,
+    end_capital = tail(x$capital, 1L),
+    gross_futures_pnl = sum(x$gross_futures_pnl),
+    transaction_cost = sum(x$transaction_cost),
+    net_futures_pnl = sum(pnl),
+    tbill_pnl = sum(x$tbill_pnl),
+    total_account_pnl = sum(x$total_pnl),
+    net_futures_return_on_start_pct = 100 * sum(pnl) / period_start_capital,
+    annualized_mean_futures_return_pct = 100 * mean(weekly_return) * 52,
+    annualized_futures_volatility_pct = 100 * stats::sd(weekly_return) * sqrt(52),
+    information_ratio = if (stats::sd(weekly_return) > 0) {
+      mean(weekly_return) / stats::sd(weekly_return) * sqrt(52)
+    } else NA_real_,
+    max_drawdown_dollars = min(drawdown),
+    max_drawdown_pct = 100 * min(drawdown / peak),
+    max_drawdown_duration_weeks = maximum_drawdown_duration,
+    positive_active_week_share = positive_active_share,
+    profit_factor = if (gross_loss > 0) gross_profit / gross_loss else NA_real_,
+    best_week_pnl = max(pnl),
+    worst_week_pnl = min(pnl),
+    contract_sides = sum(x$contract_sides_traded),
+    active_week_share = mean(active),
+    average_contracts_when_active = if (any(x$contracts > 0)) mean(x$contracts[x$contracts > 0]) else 0,
+    maximum_contracts = max(x$contracts),
+    long_weeks = sum(x$direction > 0), short_weeks = sum(x$direction < 0),
+    flat_weeks = sum(x$direction == 0),
+    roll_weeks = sum(x$exec_roll),
+    margin_cap_bindings = sum(x$margin_cap_binding),
+    margin_entry_caps = sum(x$margin_entry_cap),
+    margin_forced_reductions = sum(x$margin_forced_reduction),
+    maintenance_margin_calls = sum(x$maintenance_margin_call),
+    maximum_stress_margin_utilization = max(x$stress_margin_utilization_start),
+    maximum_gross_notional_to_equity = max(x$gross_notional / x$capital_start_week),
+    account_cagr_pct = 100 * (
+      (tail(x$capital, 1L) / period_start_capital)^(1 / period_years) - 1
+    ),
+    annualized_account_volatility_pct =
+      100 * stats::sd(account_return) * sqrt(52),
+    account_sharpe_ratio = if (stats::sd(account_excess_return) > 0) {
+      mean(account_excess_return) /
+        stats::sd(account_excess_return) * sqrt(52)
+    } else {
+      NA_real_
+    },
+    max_account_drawdown_pct = 100 * min(account_drawdown / account_peak),
+    stringsAsFactors = FALSE
+  )
+}
+
+period_results <- list()
+annual_results_optimized <- list()
+long_short_results <- list()
+for (id in names(frozen_runs)) {
+  w <- frozen_runs[[id]]$weekly
+  period_results[[paste0(id, "_cal")]] <- summarise_period(id, w,
+    "Calibration 2000-2016", w$date <= OPT_CAL_END)
+  period_results[[paste0(id, "_oos")]] <- summarise_period(id, w,
+    "Retrospective OOS 2017-2025", w$date >= OPT_OOS_START)
+  period_results[[paste0(id, "_full")]] <- summarise_period(id, w,
+    "Full 2000-2025", rep(TRUE, nrow(w)))
+  annual_results_optimized[[id]] <- w |>
+    dplyr::mutate(year = lubridate::year(date)) |>
+    dplyr::group_by(year) |>
+    dplyr::summarise(run_id = id,
+                     gross_futures_pnl = sum(gross_futures_pnl),
+                     transaction_cost = sum(transaction_cost),
+                     net_futures_pnl = sum(net_futures_pnl), .groups = "drop")
+  long_short_results[[id]] <- w |>
+    dplyr::mutate(side = dplyr::case_when(direction > 0 ~ "Long",
+                                           direction < 0 ~ "Short", TRUE ~ "Flat")) |>
+    dplyr::group_by(side) |>
+    dplyr::summarise(run_id = id, weeks = dplyr::n(),
+                     gross_futures_pnl = sum(gross_futures_pnl),
+                     transaction_cost = sum(transaction_cost),
+                     net_futures_pnl = sum(net_futures_pnl), .groups = "drop")
+}
+period_results <- dplyr::bind_rows(period_results)
+annual_results_optimized <- dplyr::bind_rows(annual_results_optimized)
+long_short_results <- dplyr::bind_rows(long_short_results)
+
+# B forecast diagnostics are descriptive and never feed the selection rule.
+forecast_accuracy <- forecast_signals |>
+  dplyr::mutate(period = period_labels(date),
+                sign_correct = sign(raw_forecast_gap) == sign(realized_log_change),
+                error = raw_forecast_gap - realized_log_change) |>
+  dplyr::group_by(contract_rank, period) |>
+  dplyr::summarise(weeks = dplyr::n(),
+                   mean_forecast = mean(raw_forecast_gap),
+                   mean_realized = mean(realized_log_change),
+                   directional_accuracy = mean(sign_correct),
+                   rmse = sqrt(mean(error^2)),
+                   correlation = stats::cor(raw_forecast_gap, realized_log_change),
+                   .groups = "drop")
+
+# Unit-size frozen rules separate signal/timing evidence from the chosen risk
+# scale. Always-long unit benchmarks reveal whether B is mainly harvesting a
+# persistent long crude exposure rather than distinctive forecast timing.
+unit_frozen_runs <- list()
+for (id in names(frozen_runs)) {
+  rank <- frozen_runs[[id]]$weekly$contract_rank[1L]
+  unit_frozen_runs[[id]] <- list(
+    position = frozen_runs[[id]]$position,
+    weekly = simulate_outright(
+      execution_by_rank[[as.character(rank)]], frozen_runs[[id]]$position,
+      OPT_COSTS[[as.character(rank)]], "unit", 26L,
+      paste0(id, "_unit"), add_terminal_liquidation = TRUE
+    )
+  )
+}
+
+always_long_unit_runs <- list()
+for (rank in sort(unique(c(1L, 2L, 3L, MODEL_FORECAST_RANKS)))) {
+  ex <- execution_by_rank[[as.character(rank)]]
+  id <- paste0("AlwaysLong_CL", rank)
+  always_long_unit_runs[[id]] <- list(
+    position = rep(1L, nrow(ex)),
+    weekly = simulate_outright(
+      ex, rep(1L, nrow(ex)), OPT_COSTS[[as.character(rank)]],
+      "unit", 26L, id, add_terminal_liquidation = TRUE
+    )
+  )
+}
+
+all_period_summaries <- function(run_list, result_type) {
+  rows <- list()
+  j <- 0L
+  for (id in names(run_list)) {
+    w <- run_list[[id]]$weekly
+    for (definition in list(
+      list(name = "Calibration 2000-2016", idx = w$date <= OPT_CAL_END),
+      list(name = "Retrospective OOS 2017-2025", idx = w$date >= OPT_OOS_START),
+      list(name = "Full 2000-2025", idx = rep(TRUE, nrow(w)))
+    )) {
+      j <- j + 1L
+      rows[[j]] <- summarise_period(id, w, definition$name, definition$idx)
+      rows[[j]]$result_type <- result_type
+    }
+  }
+  dplyr::bind_rows(rows)
+}
+
+unit_period_results <- all_period_summaries(unit_frozen_runs, "Frozen timing, one contract")
+always_long_benchmarks <- all_period_summaries(always_long_unit_runs, "Always long, one contract")
+raw_baseline_period_results <- all_period_summaries(
+  raw_baseline_runs, "Raw signal, one contract"
+)
+
+extract_episodes <- function(id, run_object) {
+  pos <- run_object$position
+  w <- run_object$weekly
+  starts <- which(pos != 0L & pos != c(0L, head(pos, -1L)))
+  if (!length(starts)) return(data.frame())
+  rows <- lapply(seq_along(starts), function(j) {
+    s <- starts[j]
+    next_change <- which(seq_along(pos) > s & pos != pos[s])[1L]
+    e <- if (is.na(next_change)) length(pos) else next_change - 1L
+    data.frame(
+      run_id = id, entry_date = w$date[s], exit_date = w$date[e],
+      direction = pos[s], holding_weeks = e - s + 1L,
+      gross_futures_pnl = sum(w$gross_futures_pnl[s:e]),
+      transaction_cost = sum(w$transaction_cost[s:e]),
+      net_futures_pnl = sum(w$net_futures_pnl[s:e]),
+      stringsAsFactors = FALSE
+    )
+  })
+  dplyr::bind_rows(rows)
+}
+trade_episodes <- dplyr::bind_rows(lapply(names(frozen_runs), function(id) {
+  extract_episodes(id, frozen_runs[[id]])
+}))
+holding_period_summary <- trade_episodes |>
+  dplyr::group_by(run_id) |>
+  dplyr::summarise(trades = dplyr::n(), median_holding_weeks = stats::median(holding_weeks),
+                   mean_holding_weeks = mean(holding_weeks),
+                   maximum_holding_weeks = max(holding_weeks), .groups = "drop")
+
+annual_concentration <- annual_results_optimized |>
+  dplyr::group_by(run_id) |>
+  dplyr::summarise(
+    positive_years = sum(net_futures_pnl > 0),
+    negative_years = sum(net_futures_pnl < 0),
+    best_year = year[which.max(net_futures_pnl)],
+    best_year_pnl = max(net_futures_pnl),
+    worst_year = year[which.min(net_futures_pnl)],
+    worst_year_pnl = min(net_futures_pnl),
+    largest_absolute_year_share = max(abs(net_futures_pnl)) / sum(abs(net_futures_pnl)),
+    .groups = "drop"
+  )
+
+cost_sensitivity_frozen <- list()
+j <- 0L
+for (id in names(frozen_runs)) {
+  w <- frozen_runs[[id]]$weekly
+  for (period_name in c("Calibration 2000-2016", "Retrospective OOS 2017-2025", "Full 2000-2025")) {
+    idx <- if (period_name == "Calibration 2000-2016") w$date <= OPT_CAL_END else
+      if (period_name == "Retrospective OOS 2017-2025") w$date >= OPT_OOS_START else
+        rep(TRUE, nrow(w))
+    for (multiplier in c(0.5, 1, 2)) {
+      j <- j + 1L
+      cost <- sum(w$transaction_cost[idx]) * multiplier
+      cost_sensitivity_frozen[[j]] <- data.frame(
+        run_id = id, period = period_name, cost_multiplier = multiplier,
+        gross_futures_pnl = sum(w$gross_futures_pnl[idx]),
+        transaction_cost = cost,
+        net_futures_pnl = sum(w$gross_futures_pnl[idx]) - cost
+      )
+    }
+  }
+}
+cost_sensitivity_frozen <- dplyr::bind_rows(cost_sensitivity_frozen)
+
+# Re-run the already frozen specifications under the historical margin-stress
+# schedule. This is a feasibility robustness test only and cannot affect the
+# calibration ranking or any frozen entry, exit, stop or sizing choice.
+historical_margin_runs <- list()
+for (id in names(frozen_runs)) {
+  rank <- frozen_runs[[id]]$weekly$contract_rank[1L]
+  spec_id <- if (grepl("^DEV_CONTRARIAN_CL", id)) "DEV_CONTRARIAN_CL1" else id
+  spec <- frozen_specs[frozen_specs$strategy_id == spec_id, , drop = FALSE]
+  score <- if (grepl("^DEV_CONTRARIAN_CL", id)) z_deviation else
+    forecast_signal_rows[[as.character(rank)]]$z_model_forecast
+  historical_margin_runs[[id]] <- run_frozen(
+    spec, score, execution_by_rank[[as.character(rank)]],
+    OPT_COSTS[[as.character(rank)]], paste0(id, "_historical_margin"),
+    margin_scenario = "historical"
+  )
+}
+historical_margin_period_results <- all_period_summaries(
+  historical_margin_runs, "Historical stressed-margin robustness"
+)
+margin_stress_comparison <- period_results |>
+  dplyr::select(run_id, period,
+                primary_net_futures_pnl = net_futures_pnl,
+                primary_maximum_contracts = maximum_contracts,
+                primary_margin_cap_bindings = margin_cap_bindings) |>
+  dplyr::left_join(
+    historical_margin_period_results |>
+      dplyr::select(run_id, period,
+                    historical_net_futures_pnl = net_futures_pnl,
+                    historical_maximum_contracts = maximum_contracts,
+                    historical_margin_cap_bindings = margin_cap_bindings),
+    by = c("run_id", "period")
+  ) |>
+  dplyr::mutate(
+    net_futures_pnl_change = historical_net_futures_pnl - primary_net_futures_pnl
+  )
+
+#############################################################################
+# 6. Checks, exports and plots
+#############################################################################
+
+optimization_checks <- data.frame(
+  Check = c(
+    "Broad grid has 27 cells per optimized strategy",
+    "Only contrarian CL1 and five model-forecast maturities are optimized",
+    "Raw baselines cover three contrarian and five model-forecast maturities",
+    "CL1 raw baselines reconcile across the two reporting layers",
+    "All frozen specifications use calibration evidence only",
+    "Contrarian uses empirical chi normalizer with theoretical fallback",
+    "Model-forecast annual normalizers end before their trading year",
+    "Posted initial margin equals maturity-specific schedule times contracts",
+    "Stressed margin never exceeds 80% of start-of-week equity",
+    "Margin is the only post-sizing feasibility constraint",
+    "No 10-contract ceiling remains active",
+    "No 100% gross-notional-to-equity ceiling remains active",
+    "All transaction costs are non-negative",
+    "All positions use actual named underlyings",
+    "Sizing volatility uses executable pre-2000 history only",
+    "Start-of-week equity returns are finite",
+    "OOS starts after calibration ends",
+    "Model-forecast maturities are all reported and no winner is selected"
+  ),
+  Passed = c(
+    all(table(broad_results$strategy_id) == 27L),
+    setequal(unique(broad_results$strategy_id), c("DEV_CONTRARIAN_CL1", paste0("MODEL_FORECAST_CL", MODEL_FORECAST_RANKS))),
+    setequal(
+      names(raw_baseline_runs),
+      c(paste0("RAW_DEV_CONTRARIAN_CL", c(1L, DEVIATION_ROBUSTNESS_RANKS)),
+        paste0("RAW_MODEL_FORECAST_CL", MODEL_FORECAST_RANKS))
+    ),
+    max(abs(raw_baseline_runs[["RAW_DEV_CONTRARIAN_CL1"]]$weekly$net_futures_pnl -
+              weekly_deviation$net_futures_pnl)) < 1e-8 &&
+      max(abs(raw_baseline_runs[["RAW_MODEL_FORECAST_CL1"]]$weekly$net_futures_pnl -
+                weekly_forecast$net_futures_pnl)) < 1e-8,
+    all(frozen_specs$completed_trades >= OPT_MIN_TRADES),
+    all(is.finite(normalizer_deviation) & normalizer_deviation > 0),
+    all(lubridate::year(forecast_normalizers$training_end) < forecast_normalizers$trading_year),
+    all(abs(weekly_frozen$margin_posted -
+              weekly_frozen$contracts * weekly_frozen$margin_per_contract_initial) < 1e-8),
+    all(weekly_frozen$stress_margin_required <=
+          weekly_frozen$stress_margin_limit + 1e-8),
+    all(weekly_frozen$contracts == pmin(
+      weekly_frozen$desired_contracts_before_margin,
+      weekly_frozen$margin_capacity_contracts
+    )),
+    max(weekly_frozen$contracts) > 10L,
+    max(weekly_frozen$gross_notional / weekly_frozen$capital_start_week) > 1,
+    all(weekly_frozen$transaction_cost >= 0),
+    all(!is.na(weekly_frozen$target_ticker) & nzchar(weekly_frozen$target_ticker)),
+    all(sizing_initialization_audit$sizing_history_start <
+          sizing_initialization_audit$first_trade_date) &&
+      all(sizing_initialization_audit$observations_before_first_trade >= 52L) &&
+      all(is.finite(sizing_initialization_audit$ema_sd_13_at_first_trade)) &&
+      all(is.finite(sizing_initialization_audit$ema_sd_26_at_first_trade)) &&
+      all(is.finite(sizing_initialization_audit$ema_sd_52_at_first_trade)),
+    all(is.finite(weekly_frozen$net_futures_pnl /
+                    weekly_frozen$capital_start_week)),
+    OPT_CAL_END < OPT_OOS_START,
+    setequal(paste0("MODEL_FORECAST_CL", MODEL_FORECAST_RANKS), frozen_specs$strategy_id[grepl("^MODEL_FORECAST_", frozen_specs$strategy_id)])
+  ),
+  stringsAsFactors = FALSE
+)
+if (!all(optimization_checks$Passed)) {
+  print(optimization_checks)
+  stop("One or more optimization implementation checks failed")
+}
+
+dir.create(PATH_OUTPUT, recursive = TRUE, showWarnings = FALSE)
+utils::write.csv(raw_baseline_period_results,
+                 file.path(PATH_OUTPUT, "19_raw_one_contract_baselines.csv"),
+                 row.names = FALSE)
+utils::write.csv(broad_results, file.path(PATH_OUTPUT, "20_optimization_broad_grid.csv"), row.names = FALSE)
+utils::write.csv(local_results, file.path(PATH_OUTPUT, "21_optimization_local_stability.csv"), row.names = FALSE)
+utils::write.csv(sizing_results, file.path(PATH_OUTPUT, "22_optimization_sizing_sensitivity.csv"), row.names = FALSE)
+utils::write.csv(frozen_specs, file.path(PATH_OUTPUT, "23_optimization_frozen_specs.csv"), row.names = FALSE)
+utils::write.csv(period_results, file.path(PATH_OUTPUT, "24_optimization_period_results.csv"), row.names = FALSE)
+utils::write.csv(annual_results_optimized, file.path(PATH_OUTPUT, "25_optimization_annual_results.csv"), row.names = FALSE)
+utils::write.csv(long_short_results, file.path(PATH_OUTPUT, "26_optimization_long_short.csv"), row.names = FALSE)
+utils::write.csv(forecast_normalizers, file.path(PATH_OUTPUT, "27_model_forecast_training_normalizers.csv"), row.names = FALSE)
+utils::write.csv(forecast_accuracy, file.path(PATH_OUTPUT, "28_model_forecast_accuracy.csv"), row.names = FALSE)
+utils::write.csv(optimization_checks, file.path(PATH_OUTPUT, "29_optimization_checks.csv"), row.names = FALSE)
+utils::write.csv(weekly_frozen, file.path(PATH_OUTPUT, "30_optimization_weekly_frozen.csv"), row.names = FALSE)
+utils::write.csv(unit_period_results, file.path(PATH_OUTPUT, "33_frozen_one_contract_results.csv"), row.names = FALSE)
+utils::write.csv(always_long_benchmarks, file.path(PATH_OUTPUT, "34_always_long_one_contract_benchmarks.csv"), row.names = FALSE)
+utils::write.csv(trade_episodes, file.path(PATH_OUTPUT, "35_trade_episodes.csv"), row.names = FALSE)
+utils::write.csv(holding_period_summary, file.path(PATH_OUTPUT, "36_holding_period_summary.csv"), row.names = FALSE)
+utils::write.csv(annual_concentration, file.path(PATH_OUTPUT, "37_annual_concentration.csv"), row.names = FALSE)
+utils::write.csv(cost_sensitivity_frozen, file.path(PATH_OUTPUT, "38_frozen_cost_sensitivity.csv"), row.names = FALSE)
+utils::write.csv(OPT_MARGIN_SCHEDULE, file.path(PATH_OUTPUT, "39_outright_margin_schedule.csv"), row.names = FALSE)
+utils::write.csv(historical_margin_period_results, file.path(PATH_OUTPUT, "40_historical_margin_stress_period_results.csv"), row.names = FALSE)
+utils::write.csv(margin_stress_comparison, file.path(PATH_OUTPUT, "41_margin_stress_comparison.csv"), row.names = FALSE)
+utils::write.csv(sizing_initialization_audit,
+                 file.path(PATH_OUTPUT, "42_sizing_history_initialization.csv"),
+                 row.names = FALSE)
+
+saveRDS(
+  list(
+    frozen_research_choices = list(
+      calibration_end = OPT_CAL_END, oos_start = OPT_OOS_START,
+      broad_grid = broad_grid, sizing_design = sizing_design,
+      costs = OPT_COSTS, margin_schedule = OPT_MARGIN_SCHEDULE,
+      maximum_stress_margin_utilization = OPT_MAX_STRESS_MARGIN_UTILIZATION,
+      tbill_haircut = OPT_TBILL_HAIRCUT,
+      risk_scale = OPT_RISK_SCALE, min_contracts = OPT_MIN_CONTRACTS,
+      minimum_trades = OPT_MIN_TRADES,
+      sizing_history_start = min(sizing_initialization_audit$sizing_history_start)
+    ),
+    baseline = list(
+      design = directional_design,
+      annual_parameter_estimates = theta_list,
+      signal_frame_CL1 = signal_frame,
+      weekly_deviation_CL1 = weekly_deviation,
+      weekly_model_forecast_CL1 = weekly_forecast,
+      period_summaries = period_summary
+    ),
+    signals = list(
+      deviation_z = z_deviation,
+      deviation_normalizer = normalizer_deviation,
+      model_forecast = forecast_signals,
+      model_forecast_normalizers = forecast_normalizers
+    ),
+    searches = searches,
+    raw_baseline_runs = raw_baseline_runs,
+    frozen_specs = frozen_specs,
+    frozen_runs = frozen_runs,
+    historical_margin_runs = historical_margin_runs,
+    sizing_initialization_audit = sizing_initialization_audit,
+    summaries = list(periods = period_results,
+                     raw_one_contract_periods = raw_baseline_period_results,
+                     historical_margin_periods = historical_margin_period_results,
+                     margin_stress_comparison = margin_stress_comparison,
+                     one_contract_periods = unit_period_results,
+                     always_long_benchmarks = always_long_benchmarks,
+                     annual = annual_results_optimized,
+                     long_short = long_short_results,
+                     holding_periods = holding_period_summary,
+                     annual_concentration = annual_concentration,
+                     cost_sensitivity = cost_sensitivity_frozen,
+                     model_forecast_accuracy = forecast_accuracy),
+    checks = optimization_checks,
+    session_info = utils::sessionInfo()
+  ),
+  file.path(PATH_OUTPUT, "Final_Directional_Strategy_Results.rds")
+)
+
+plot_period <- period_results |>
+  dplyr::filter(period != "Full 2000-2025") |>
+  dplyr::mutate(run_id = factor(run_id, levels = unique(run_id)))
+optimization_period_plot <- ggplot2::ggplot(
+  plot_period, ggplot2::aes(run_id, net_futures_pnl / 1000, fill = period)
+) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey35") +
+  ggplot2::scale_fill_manual(values = c("#1F6A5A", "#C47A3A")) +
+  ggplot2::labs(title = "Frozen directional specifications by period",
+                subtitle = "Net futures P&L; specifications selected using 2000-2016 only",
+                x = NULL, y = "Net futures P&L ($000)", fill = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "31_frozen_period_performance.png"),
+                optimization_period_plot, width = 10, height = 5.8, dpi = 180)
+
+cumulative_plot_data <- weekly_frozen |>
+  dplyr::group_by(run_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(cumulative_net_futures_pnl = cumsum(net_futures_pnl)) |>
+  dplyr::ungroup()
+optimization_cumulative_plot <- ggplot2::ggplot(
+  cumulative_plot_data,
+  ggplot2::aes(date, cumulative_net_futures_pnl / 1000, colour = run_id)
+) +
+  ggplot2::geom_line(linewidth = 0.7) +
+  ggplot2::geom_vline(xintercept = as.numeric(OPT_OOS_START), linetype = "dashed") +
+  ggplot2::labs(title = "Cumulative net futures P&L",
+                subtitle = "Dashed line marks the frozen 2017 retrospective-OOS start",
+                x = NULL, y = "Cumulative net P&L ($000)", colour = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank(), legend.position = "bottom")
+ggplot2::ggsave(file.path(PATH_OUTPUT, "32_cumulative_frozen_performance.png"),
+                optimization_cumulative_plot, width = 10, height = 6.2, dpi = 180)
+
+drawdown_plot_data <- weekly_frozen |>
+  dplyr::group_by(run_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    futures_equity = OPT_INITIAL_CAPITAL + cumsum(net_futures_pnl),
+    futures_peak = cummax(futures_equity),
+    drawdown_pct = 100 * (futures_equity / futures_peak - 1)
+  ) |>
+  dplyr::ungroup()
+drawdown_plot <- ggplot2::ggplot(
+  drawdown_plot_data, ggplot2::aes(date, drawdown_pct, colour = run_id)
+) +
+  ggplot2::geom_line(linewidth = 0.6) +
+  ggplot2::geom_vline(xintercept = as.numeric(OPT_OOS_START), linetype = "dashed") +
+  ggplot2::labs(
+    title = "Frozen-strategy futures drawdowns",
+    subtitle = "Net futures P&L only; dashed line marks 2017",
+    x = NULL, y = "Drawdown (%)", colour = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(legend.position = "bottom", panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "43_frozen_drawdowns.png"),
+                drawdown_plot, width = 10, height = 6.2, dpi = 180)
+
+annual_pnl_plot <- ggplot2::ggplot(
+  annual_results_optimized,
+  ggplot2::aes(factor(year), net_futures_pnl / 1000,
+               fill = net_futures_pnl >= 0)
+) +
+  ggplot2::geom_col(show.legend = FALSE) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey35") +
+  ggplot2::facet_wrap(~run_id, scales = "free_y", ncol = 2) +
+  ggplot2::scale_fill_manual(values = c("#B5523B", "#1F6A5A")) +
+  ggplot2::labs(title = "Annual net futures P&L by frozen strategy",
+                x = NULL, y = "Net futures P&L ($000)") +
+  ggplot2::theme_minimal(base_size = 9) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5),
+                 panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "44_annual_net_futures_pnl.png"),
+                annual_pnl_plot, width = 12, height = 12, dpi = 180)
+
+contract_count_plot <- ggplot2::ggplot(
+  weekly_frozen, ggplot2::aes(date, contracts, colour = run_id)
+) +
+  ggplot2::geom_step(linewidth = 0.45) +
+  ggplot2::geom_vline(xintercept = as.numeric(OPT_OOS_START), linetype = "dashed") +
+  ggplot2::facet_wrap(~run_id, scales = "free_y", ncol = 2) +
+  ggplot2::labs(title = "Contracts held through time",
+                subtitle = "Fixed at entry except for margin-forced reductions",
+                x = NULL, y = "Contracts", colour = NULL) +
+  ggplot2::theme_minimal(base_size = 9) +
+  ggplot2::theme(legend.position = "none", panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "45_contracts_held.png"),
+                contract_count_plot, width = 12, height = 12, dpi = 180)
+
+forecast_maturity_plot_data <- period_results |>
+  dplyr::filter(grepl("^MODEL_FORECAST_CL", run_id),
+                period != "Full 2000-2025") |>
+  dplyr::mutate(contract_rank = as.integer(sub("MODEL_FORECAST_CL", "", run_id)))
+forecast_maturity_plot <- ggplot2::ggplot(
+  forecast_maturity_plot_data,
+  ggplot2::aes(factor(contract_rank), net_futures_pnl / 1000, fill = period)
+) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey35") +
+  ggplot2::scale_fill_manual(values = c("#1F6A5A", "#C47A3A")) +
+  ggplot2::labs(title = "Model-forecast strategy across maturities",
+                subtitle = "Each maturity has its own calibration-frozen timing rule",
+                x = "Generic contract rank", y = "Net futures P&L ($000)", fill = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "46_model_forecast_maturity_comparison.png"),
+                forecast_maturity_plot, width = 9, height = 5.5, dpi = 180)
+
+raw_cumulative_plot_data <- dplyr::bind_rows(
+  lapply(raw_baseline_runs, `[[`, "weekly"), .id = "run_id"
+) |>
+  dplyr::group_by(run_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(cumulative_net_futures_pnl = cumsum(net_futures_pnl)) |>
+  dplyr::ungroup()
+raw_cumulative_plot <- ggplot2::ggplot(
+  raw_cumulative_plot_data,
+  ggplot2::aes(date, cumulative_net_futures_pnl / 1000, colour = run_id)
+) +
+  ggplot2::geom_line(linewidth = 0.65) +
+  ggplot2::geom_vline(xintercept = as.numeric(OPT_OOS_START), linetype = "dashed") +
+  ggplot2::labs(title = "Raw one-contract signal baselines",
+                subtitle = "No calibrated thresholds, exits, time stops, or risk scaling",
+                x = NULL, y = "Cumulative net futures P&L ($000)", colour = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(legend.position = "bottom", panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "47_raw_baseline_cumulative.png"),
+                raw_cumulative_plot, width = 10, height = 6.2, dpi = 180)
+
+long_short_plot <- ggplot2::ggplot(
+  long_short_results |>
+    dplyr::filter(side != "Flat"),
+  ggplot2::aes(run_id, net_futures_pnl / 1000, fill = side)
+) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey35") +
+  ggplot2::labs(title = "Long- and short-side P&L attribution",
+                x = NULL, y = "Net futures P&L ($000)", fill = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                 panel.grid.minor = ggplot2::element_blank())
+ggplot2::ggsave(file.path(PATH_OUTPUT, "48_long_short_attribution.png"),
+                long_short_plot, width = 10, height = 5.8, dpi = 180)
+
+# 49) Contrarian strategy: comparable one-contract OOS implementations
+contrarian_comparison <- dplyr::bind_rows(
+  raw_baseline_runs[["RAW_DEV_CONTRARIAN_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Unoptimised one-contract signal"),
+  unit_frozen_runs[["DEV_CONTRARIAN_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Optimised trading rule"),
+  always_long_unit_runs[["AlwaysLong_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Always-long benchmark")
+) |>
+  dplyr::filter(date >= OPT_OOS_START) |>
+  dplyr::group_by(specification) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    cumulative_net_futures_pnl = cumsum(net_futures_pnl)
+  ) |>
+  dplyr::ungroup()
+
+contrarian_comparison_plot <- ggplot2::ggplot(
+  contrarian_comparison,
+  ggplot2::aes(
+    date,
+    cumulative_net_futures_pnl / 1000,
+    colour = specification
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey40") +
+  ggplot2::labs(
+    title = "Out-of-sample cumulative net futures P&L",
+    subtitle = "CL1 one-contract implementations, 2017–2025",
+    x = NULL,
+    y = "Cumulative net futures P&L ($000)",
+    colour = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "49_contrarian_oos_one_contract_comparison.png"),
+  contrarian_comparison_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300
+)
+
+# 50) Final risk-sized contrarian strategy: futures and total account P&L
+contrarian_final_oos <- frozen_runs[["DEV_CONTRARIAN_CL1"]]$weekly |>
+  dplyr::filter(date >= OPT_OOS_START) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(
+    cumulative_net_futures_pnl = cumsum(net_futures_pnl),
+    cumulative_total_account_pnl = cumsum(total_pnl)
+  )
+
+contrarian_final_plot_data <- contrarian_final_oos |>
+  dplyr::select(
+    date,
+    `Net futures P&L` = cumulative_net_futures_pnl,
+    `Total account P&L including Treasury income` =
+      cumulative_total_account_pnl
+  ) |>
+  tidyr::pivot_longer(
+    -date,
+    names_to = "series",
+    values_to = "cumulative_pnl"
+  )
+
+contrarian_final_plot <- ggplot2::ggplot(
+  contrarian_final_plot_data,
+  ggplot2::aes(date, cumulative_pnl / 1000, colour = series)
+) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey40") +
+  ggplot2::labs(
+    title = "Final risk-sized contrarian strategy",
+    subtitle = "Out-of-sample performance, 2017–2025",
+    x = NULL,
+    y = "Cumulative P&L ($000)",
+    colour = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "50_contrarian_oos_final_performance.png"),
+  contrarian_final_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300
+)
+
+# 51) Final risk-sized contrarian strategy: OOS net-futures drawdown
+contrarian_drawdown_data <- contrarian_final_oos |>
+  dplyr::mutate(
+    futures_equity =
+      dplyr::first(capital_start_week) + cumulative_net_futures_pnl,
+    futures_peak = cummax(
+      c(dplyr::first(capital_start_week), futures_equity)
+    )[-1L],
+    drawdown_pct = 100 * (futures_equity / futures_peak - 1)
+  )
+
+contrarian_drawdown_plot <- ggplot2::ggplot(
+  contrarian_drawdown_data,
+  ggplot2::aes(date, drawdown_pct)
+) +
+  ggplot2::geom_area(fill = "#7DB7E8", alpha = 0.35) +
+  ggplot2::geom_line(colour = "#2C7FB8", linewidth = 0.7) +
+  ggplot2::labs(
+    title = "Net-futures drawdown",
+    subtitle = "Final risk-sized CL1 strategy, 2017–2025",
+    x = NULL,
+    y = "Drawdown (%)"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank())
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "51_contrarian_oos_final_drawdown.png"),
+  contrarian_drawdown_plot,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+
+# 52) Final model-forecast strategies: OOS comparison across maturities
+forecast_final_oos <- weekly_frozen |>
+  dplyr::filter(
+    grepl("^MODEL_FORECAST_CL", run_id),
+    date >= OPT_OOS_START
+  ) |>
+  dplyr::group_by(run_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    cumulative_net_futures_pnl = cumsum(net_futures_pnl)
+  ) |>
+  dplyr::ungroup()
+
+forecast_final_plot <- ggplot2::ggplot(
+  forecast_final_oos,
+  ggplot2::aes(
+    date,
+    cumulative_net_futures_pnl / 1000,
+    colour = run_id
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.75) +
+  ggplot2::geom_hline(yintercept = 0, colour = "grey40") +
+  ggplot2::labs(
+    title = "Final model-forecast strategies across maturities",
+    subtitle = "Out-of-sample cumulative net futures P&L, 2017–2025",
+    x = NULL,
+    y = "Cumulative net futures P&L ($000)",
+    colour = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "52_forecast_oos_final_cumulative.png"),
+  forecast_final_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300
+)
+
+```
+
+### 14.1 Frozen specifications
+
+```{r optimization-specifications, message=FALSE, warning=FALSE}
+frozen_specs_display <- frozen_specs |>
+  dplyr::select(strategy_id, entry, exit, time_stop, sizing_mode,
+                ema_half_life, net_futures_pnl, completed_trades,
+                positive_calibration_required_fallback)
+knitr::kable(
+  frozen_specs_display,
+  digits = 2,
+  caption = "Specifications frozen using calibration data through 2016"
+)
+```
+
+### 14.2 Frozen period results
+
+```{r optimization-period-results, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+knitr::kable(
+  period_results |>
+    dplyr::select(run_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_drawdown_dollars, max_drawdown_pct,
+                  average_contracts_when_active, maximum_contracts,
+                  margin_cap_bindings, maximum_stress_margin_utilization,
+                  maximum_gross_notional_to_equity),
+  digits = 2,
+  caption = "Frozen strategy results by evaluation period"
+)
+optimization_period_plot
+```
+
+The next tables separate timing from risk scaling and place the long-biased
+model-forecast signals beside passive long futures exposure. They are
+diagnostics, not extra selection criteria.
+
+```{r optimization-benchmarks, message=FALSE, warning=FALSE}
+knitr::kable(
+  raw_baseline_period_results |>
+    dplyr::select(run_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_drawdown_dollars,
+                  long_weeks, short_weeks),
+  digits = 2,
+  caption = "Raw one-contract signal baselines without calibrated timing"
+)
+knitr::kable(
+  unit_period_results |>
+    dplyr::select(run_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_drawdown_dollars),
+  digits = 2,
+  caption = "Frozen timing rules at one contract"
+)
+knitr::kable(
+  always_long_benchmarks |>
+    dplyr::select(run_id, period, net_futures_pnl, transaction_cost,
+                  information_ratio, max_drawdown_dollars),
+  digits = 2,
+  caption = "Always-long one-contract benchmarks"
+)
+```
+
+### 14.3 Performance through time
+
+```{r optimization-cumulative, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+optimization_cumulative_plot
+drawdown_plot
+forecast_maturity_plot
+raw_cumulative_plot
+long_short_plot
+contrarian_comparison_plot
+contrarian_final_plot
+contrarian_drawdown_plot
+forecast_final_plot
+```
+
+The annual and contract-count panels are intentionally faceted because a
+single common scale would hide the cross-strategy differences.
+
+```{r optimization-faceted-plots, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+annual_pnl_plot
+contract_count_plot
+```
+
+### 14.4 Forecast and implementation diagnostics
+
+```{r optimization-diagnostics, message=FALSE, warning=FALSE}
+knitr::kable(
+  forecast_accuracy,
+  digits = 4,
+  caption = "One-week model-forecast diagnostics by maturity and period"
+)
+knitr::kable(
+  optimization_checks,
+  caption = "Optimization implementation checks"
+)
+knitr::kable(
+  holding_period_summary,
+  digits = 2,
+  caption = "Holding-period diagnostics for frozen sized strategies"
+)
+knitr::kable(
+  annual_concentration,
+  digits = 3,
+  caption = "Annual P&L concentration diagnostics"
+)
+knitr::kable(
+  margin_stress_comparison,
+  digits = 2,
+  caption = "Primary versus historical stressed-margin robustness"
+)
+```
+
+## Step 15: Thesis Main-Text Figures
+
+The following plotting-only section creates the final main-text figures. It does
+not refit the model, recalibrate a strategy, or overwrite the earlier diagnostic
+figures. When the objects above are already available in the R environment, this
+section can be rerun on its own.
+
+```{r thesis-main-text-figures-final, message=FALSE, warning=FALSE, fig.width=9, fig.height=6}
+
+thesis_required_objects <- c(
+  "raw_baseline_runs",
+  "unit_frozen_runs",
+  "always_long_unit_runs",
+  "frozen_runs",
+  "weekly_frozen",
+  "unit_period_results",
+  "always_long_benchmarks",
+  "OPT_OOS_START",
+  "PATH_OUTPUT"
+)
+thesis_missing_objects <- thesis_required_objects[
+  !vapply(thesis_required_objects, exists, logical(1), inherits = TRUE)
+]
+if (length(thesis_missing_objects) > 0L) {
+  stop(
+    "The plotting section needs objects from the completed strategy run: ",
+    paste(thesis_missing_objects, collapse = ", "),
+    ". Run the strategy through Section 12 once, then rerun this section only."
+  )
+}
+
+# A common visual system is used for all main-text strategy figures.
+thesis_colour_unoptimised <- "#7A7A7A"
+thesis_colour_optimised <- "#1F6A5A"
+thesis_colour_benchmark <- "#C47A3A"
+thesis_colour_net_futures <- "#1F6A5A"
+thesis_colour_total_account <- "#2F5597"
+thesis_colour_drawdown <- "#2C7FB8"
+thesis_maturity_colours <- c(
+  "CL1" = "#1F6A5A",
+  "CL5" = "#C47A3A",
+  "CL9" = "#2F5597",
+  "CL13" = "#8E6C8A",
+  "CL17" = "#B5523B"
+)
+
+thesis_figure_theme <- function(base_size = 11) {
+  ggplot2::theme_minimal(base_size = base_size, base_family = "sans") +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold", colour = "#222222", margin = ggplot2::margin(b = 3)
+      ),
+      plot.subtitle = ggplot2::element_text(
+        colour = "#4A4A4A", margin = ggplot2::margin(b = 9)
+      ),
+      axis.title = ggplot2::element_text(colour = "#222222"),
+      axis.text = ggplot2::element_text(colour = "#3A3A3A"),
+      legend.position = "bottom",
+      legend.title = ggplot2::element_blank(),
+      legend.text = ggplot2::element_text(colour = "#333333"),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major.x = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(10, 14, 10, 10)
+    )
+}
+
+# 53) Contrarian strategy: comparable one-contract OOS implementations.
+thesis_contrarian_comparison <- dplyr::bind_rows(
+  raw_baseline_runs[["RAW_DEV_CONTRARIAN_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Unoptimised one-contract signal"),
+  unit_frozen_runs[["DEV_CONTRARIAN_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Optimised one-contract rule"),
+  always_long_unit_runs[["AlwaysLong_CL1"]]$weekly |>
+    dplyr::mutate(specification = "Always-long benchmark")
+) |>
+  dplyr::filter(date >= OPT_OOS_START) |>
+  dplyr::group_by(specification) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(cumulative_net_futures_pnl = cumsum(net_futures_pnl)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    specification = factor(
+      specification,
+      levels = c(
+        "Unoptimised one-contract signal",
+        "Optimised one-contract rule",
+        "Always-long benchmark"
+      )
+    )
+  )
+
+thesis_contrarian_comparison_plot <- ggplot2::ggplot(
+  thesis_contrarian_comparison,
+  ggplot2::aes(
+    date,
+    cumulative_net_futures_pnl / 1000,
+    colour = specification
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.85) +
+  ggplot2::geom_hline(yintercept = 0, colour = "#4A4A4A", linewidth = 0.4) +
+  ggplot2::scale_colour_manual(values = c(
+    "Unoptimised one-contract signal" = thesis_colour_unoptimised,
+    "Optimised one-contract rule" = thesis_colour_optimised,
+    "Always-long benchmark" = thesis_colour_benchmark
+  )) +
+  ggplot2::scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Short-term-deviation contrarian strategy",
+    subtitle = "Out-of-sample comparison of one-contract implementations, 2017–2025",
+    x = NULL,
+    y = "Cumulative net futures P&L (USD thousands)"
+  ) +
+  thesis_figure_theme()
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "53_thesis_contrarian_one_contract_comparison.png"),
+  thesis_contrarian_comparison_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+# 54) Contrarian strategy: final cumulative performance and total-account drawdown.
+thesis_contrarian_final_oos <- frozen_runs[["DEV_CONTRARIAN_CL1"]]$weekly |>
+  dplyr::filter(date >= OPT_OOS_START) |>
+  dplyr::arrange(date) |>
+  dplyr::mutate(
+    cumulative_net_futures_pnl = cumsum(net_futures_pnl),
+    cumulative_total_account_pnl = cumsum(total_pnl),
+    account_peak = cummax(c(dplyr::first(capital_start_week), capital))[-1L],
+    account_drawdown_pct = 100 * (capital / account_peak - 1)
+  )
+
+thesis_contrarian_final_lines <- thesis_contrarian_final_oos |>
+  dplyr::select(
+    date,
+    `Net futures P&L` = cumulative_net_futures_pnl,
+    `Total account P&L including Treasury income` = cumulative_total_account_pnl
+  ) |>
+  tidyr::pivot_longer(
+    -date,
+    names_to = "series",
+    values_to = "cumulative_pnl"
+  ) |>
+  dplyr::mutate(
+    series = factor(
+      series,
+      levels = c(
+        "Net futures P&L",
+        "Total account P&L including Treasury income"
+      )
+    )
+  )
+
+thesis_contrarian_performance_panel <- ggplot2::ggplot(
+  thesis_contrarian_final_lines,
+  ggplot2::aes(date, cumulative_pnl / 1000, colour = series)
+) +
+  ggplot2::geom_line(linewidth = 0.85) +
+  ggplot2::geom_hline(yintercept = 0, colour = "#4A4A4A", linewidth = 0.4) +
+  ggplot2::scale_colour_manual(values = c(
+    "Net futures P&L" = thesis_colour_net_futures,
+    "Total account P&L including Treasury income" = thesis_colour_total_account
+  )) +
+  ggplot2::scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Cumulative performance",
+    x = NULL,
+    y = "Cumulative P&L (USD thousands)"
+  ) +
+  thesis_figure_theme()
+
+thesis_contrarian_drawdown_panel <- ggplot2::ggplot(
+  thesis_contrarian_final_oos,
+  ggplot2::aes(date, account_drawdown_pct)
+) +
+  ggplot2::geom_area(fill = thesis_colour_drawdown, alpha = 0.22) +
+  ggplot2::geom_line(colour = thesis_colour_drawdown, linewidth = 0.65) +
+  ggplot2::geom_hline(yintercept = 0, colour = "#4A4A4A", linewidth = 0.4) +
+  ggplot2::scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  ggplot2::scale_y_continuous(labels = scales::label_number(suffix = "%")) +
+  ggplot2::labs(
+    title = "Total-account drawdown",
+    x = NULL,
+    y = "Drawdown"
+  ) +
+  thesis_figure_theme() +
+  ggplot2::theme(legend.position = "none")
+
+thesis_contrarian_final_figure <- patchwork::wrap_plots(
+  thesis_contrarian_performance_panel,
+  thesis_contrarian_drawdown_panel,
+  ncol = 1,
+  heights = c(1.35, 1),
+  guides = "collect"
+) +
+  patchwork::plot_annotation(
+    title = "Final short-term-deviation contrarian strategy",
+    subtitle = "Out-of-sample performance, 2017–2025",
+    tag_levels = "A",
+    theme = ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", size = 14, colour = "#222222"),
+      plot.subtitle = ggplot2::element_text(size = 11, colour = "#4A4A4A")
+    )
+  ) &
+  ggplot2::theme(legend.position = "bottom")
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "54_thesis_contrarian_final_performance_and_drawdown.png"),
+  thesis_contrarian_final_figure,
+  width = 9,
+  height = 8.2,
+  dpi = 300,
+  bg = "white"
+)
+
+# 55) Model-forecast strategy: optimised one-contract rules versus always-long benchmarks.
+thesis_forecast_optimised_oos <- unit_period_results |>
+  dplyr::filter(
+    grepl("^MODEL_FORECAST_CL", run_id),
+    grepl("OOS", period)
+  ) |>
+  dplyr::transmute(
+    maturity = sub("MODEL_FORECAST_", "", run_id),
+    optimised_pnl = net_futures_pnl
+  )
+
+thesis_forecast_benchmark_oos <- always_long_benchmarks |>
+  dplyr::filter(
+    grepl("^AlwaysLong_CL", run_id),
+    grepl("OOS", period),
+    sub("AlwaysLong_", "", run_id) %in% c("CL1", "CL5", "CL9", "CL13", "CL17")
+  ) |>
+  dplyr::transmute(
+    maturity = sub("AlwaysLong_", "", run_id),
+    benchmark_pnl = net_futures_pnl
+  )
+
+thesis_forecast_benchmark_comparison <- dplyr::inner_join(
+  thesis_forecast_optimised_oos,
+  thesis_forecast_benchmark_oos,
+  by = "maturity"
+) |>
+  dplyr::mutate(
+    maturity = factor(
+      maturity,
+      levels = rev(c("CL1", "CL5", "CL9", "CL13", "CL17"))
+    )
+  )
+
+thesis_forecast_benchmark_points <- thesis_forecast_benchmark_comparison |>
+  dplyr::select(
+    maturity,
+    `Optimised one-contract rule` = optimised_pnl,
+    `Always-long benchmark` = benchmark_pnl
+  ) |>
+  tidyr::pivot_longer(
+    -maturity,
+    names_to = "implementation",
+    values_to = "net_futures_pnl"
+  ) |>
+  dplyr::mutate(
+    implementation = factor(
+      implementation,
+      levels = c("Optimised one-contract rule", "Always-long benchmark")
+    )
+  )
+
+thesis_forecast_benchmark_plot <- ggplot2::ggplot() +
+  ggplot2::geom_segment(
+    data = thesis_forecast_benchmark_comparison,
+    ggplot2::aes(
+      x = benchmark_pnl / 1000,
+      xend = optimised_pnl / 1000,
+      y = maturity,
+      yend = maturity
+    ),
+    colour = "#B8B8B8",
+    linewidth = 0.9
+  ) +
+  ggplot2::geom_point(
+    data = thesis_forecast_benchmark_points,
+    ggplot2::aes(
+      net_futures_pnl / 1000,
+      maturity,
+      colour = implementation,
+      shape = implementation
+    ),
+    size = 3.3
+  ) +
+  ggplot2::geom_vline(xintercept = 0, colour = "#4A4A4A", linewidth = 0.4) +
+  ggplot2::scale_colour_manual(values = c(
+    "Optimised one-contract rule" = thesis_colour_optimised,
+    "Always-long benchmark" = thesis_colour_benchmark
+  )) +
+  ggplot2::scale_shape_manual(values = c(
+    "Optimised one-contract rule" = 16,
+    "Always-long benchmark" = 17
+  )) +
+  ggplot2::labs(
+    title = "One-week model-forecast strategy",
+    subtitle = "Optimised one-contract rules versus always-long benchmarks, 2017–2025",
+    x = "Net futures P&L (USD thousands)",
+    y = "Contract maturity",
+    colour = NULL,
+    shape = NULL
+  ) +
+  thesis_figure_theme()
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "55_thesis_forecast_one_contract_benchmark_comparison.png"),
+  thesis_forecast_benchmark_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+# 56) Model-forecast strategy: final OOS cumulative net futures P&L.
+thesis_forecast_oos_cumulative <- weekly_frozen |>
+  dplyr::filter(
+    grepl("^MODEL_FORECAST_CL", run_id),
+    date >= OPT_OOS_START
+  ) |>
+  dplyr::group_by(run_id) |>
+  dplyr::arrange(date, .by_group = TRUE) |>
+  dplyr::mutate(
+    cumulative_net_futures_pnl = cumsum(net_futures_pnl)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    maturity = factor(
+      sub("MODEL_FORECAST_", "", run_id),
+      levels = c("CL1", "CL5", "CL9", "CL13", "CL17")
+    )
+  )
+
+thesis_forecast_oos_cumulative_plot <- ggplot2::ggplot(
+  thesis_forecast_oos_cumulative,
+  ggplot2::aes(
+    date,
+    cumulative_net_futures_pnl / 1000,
+    colour = maturity
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::geom_hline(yintercept = 0, colour = "#4A4A4A", linewidth = 0.4) +
+  ggplot2::scale_colour_manual(
+    values = thesis_maturity_colours,
+    breaks = c("CL1", "CL5", "CL9", "CL13", "CL17")
+  ) +
+  ggplot2::scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Final one-week model-forecast strategies",
+    subtitle = "Out-of-sample cumulative net futures P&L, 2017–2025",
+    x = NULL,
+    y = "Cumulative net futures P&L (USD thousands)",
+    colour = NULL
+  ) +
+  thesis_figure_theme() +
+  ggplot2::guides(colour = ggplot2::guide_legend(nrow = 1, byrow = TRUE))
+
+ggplot2::ggsave(
+  file.path(PATH_OUTPUT, "56_thesis_forecast_oos_cumulative_net_futures_pnl.png"),
+  thesis_forecast_oos_cumulative_plot,
+  width = 9,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+thesis_contrarian_comparison_plot
+thesis_contrarian_final_figure
+thesis_forecast_benchmark_plot
+thesis_forecast_oos_cumulative_plot
+
+```
