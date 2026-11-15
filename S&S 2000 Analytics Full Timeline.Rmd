@@ -1,0 +1,2133 @@
+---
+title: "S&S 2000 Analytics Full Timeline"
+author: "Fabian Welti"
+date: "2026-02-19"
+output: html_document
+---
+
+## Loading Packages & Estimated Model Outputs for Further Analysis
+
+This section loads the estimation results produced by the S&S 2000 Full Timeline script. The final model outputs were saved at the end of the estimation pipeline and are restored here using the same object names. This ensures full consistency with the original estimation while allowing all subsequent analyses, diagnostics, and summaries to be performed without re-running the estimation step.
+
+```{r setup, include=FALSE}
+
+# Packeges 
+library(tibble)
+library(FKF)
+library(numDeriv)
+library(MASS)
+library(dplyr)
+library(tseries) # jarque.bera.test
+library(tidyr)
+library(ggplot2)
+library(cowplot)   # for panel layout
+library(gridExtra) # for residual table grob
+library(purrr)
+library(lubridate)
+library(scales)
+
+# Seed
+set.seed(42)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+# Path to the exported estimation results (relative to this notebook)
+RESULTS_DIR <- file.path("results")
+
+FUN_PATH    <- file.path(RESULTS_DIR, "ss_functions_for_analytics_FullTimeline_V2.0.R")
+BUNDLE_PATH <- file.path(RESULTS_DIR, "ss_fit_bundle_for_analytics_FullTimeline_V2.0.rds")
+
+stopifnot(file.exists(FUN_PATH))
+stopifnot(file.exists(BUNDLE_PATH))
+
+# --- Load function definitions used later (A_fun, make_ss_arrays, etc.)
+knit_env <- knitr::knit_global()
+sys.source(FUN_PATH, envir = knit_env)
+
+# --- Load saved estimation outputs from Full Timeline
+fit_bundle <- readRDS(BUNDLE_PATH)
+
+# --- Restore objects under the names used throughout this Analytics Rmd
+theta_hat_SS_FullTimeline_V2.0 <- fit_bundle$theta_hat
+
+
+Y         <- fit_bundle$Y
+Tau       <- fit_bundle$Tau
+Delta_t   <- fit_bundle$Delta_t
+
+if (!is.null(fit_bundle$obs_dates)) obs_dates <- fit_bundle$obs_dates
+if (!is.null(fit_bundle$kf))        kf_hat    <- fit_bundle$kf
+if (!is.null(fit_bundle$best))      best      <- fit_bundle$best
+
+cat("FUN_PATH =", FUN_PATH, "\n")
+
+
+```
+
+## Step 1: Model Fit Summary and Key Implied Quantities (Schwartz–Smith 2000)
+
+This step provides a concise summary of the estimated two-factor Schwartz–Smith (2000) model using the full available futures price sample. The purpose is to document the overall in-sample fit of the model, report the key structural parameter estimates, and compute economically meaningful implied quantities that are central to the interpretation of the model. This mirrors the role of Table 2 in Schwartz and Smith (2000), which presents parameter estimates and highlights the dynamic properties of the short-term and long-term factors.
+
+The model is estimated on five futures contracts observed over 2,218 weekly observations, resulting in a well-identified specification with twelve estimated parameters. The estimated speed of mean reversion of the short-term deviation factor implies a half-life of approximately 0.83 years, or about 43 weeks. This indicates that transitory price shocks dissipate relatively quickly, though somewhat more slowly than in the original Schwartz and Smith (2000) sample. The volatility of the short-term factor is larger than that of the long-term factor, consistent with the interpretation that short-run fluctuations are more volatile, while the equilibrium component evolves smoothly over time.
+
+The estimated correlation between innovations to the short-term and long-term factors is small but positive, suggesting limited contemporaneous interaction between temporary shocks and long-run movements in prices. The implied long-term risk premium, defined as the difference between the drift parameters of the two factors, is positive and economically meaningful. Measurement error standard deviations decline strongly with maturity, with very small observation noise for longer-dated contracts. This pattern closely aligns with the intuition in Schwartz and Smith (2000) that long-maturity futures prices primarily reflect the persistent equilibrium component rather than short-term fluctuations.
+
+Overall, the parameter estimates and implied quantities are economically sensible and broadly consistent with the findings in Schwartz and Smith (2000), providing a solid foundation for the subsequent statistical diagnostics, pricing checks, and out-of-sample analyses.
+
+```{r step1}
+# Parameter object: use S&S 2000 Full Timeline naming and alias to a generic handle
+rm(theta_hat)  # prevent accidentally using an old theta_hat from the workspace
+theta_hat <- theta_hat_SS_FullTimeline_V2.0
+
+# Observation matrix checks
+stopifnot(exists("Y"), is.matrix(Y))
+T_len <- ncol(Y)   # number of time periods
+n_mat <- nrow(Y)   # number of maturities / contracts
+
+# Structural consistency: one measurement SD per maturity
+stopifnot(length(theta_hat$sigma_obs_vec) == n_mat)
+
+message(sprintf("Y matrix: %d maturities × %d observations", n_mat, T_len))
+message(sprintf("theta_hat_SS_FullTimeline_V2.0 loaded (kappa=%.3f, sigma_chi=%.3f, sigma_xi=%.3f, rho=%.3f)",
+                theta_hat$kappa, theta_hat$sigma_chi, theta_hat$sigma_xi, theta_hat$rho))
+
+# Log-likelihood and information criteria
+LL <- if (exists("best") && is.list(best) && !is.null(best$value)) {
+  -as.numeric(best$value)  # optim stores NEGATIVE logLik in $value
+} else {
+  NA_real_
+}
+
+# Parameter count: 7 structural + number of measurement SDs
+k_par <- 7 + length(theta_hat$sigma_obs_vec)
+
+AIC <- if (is.finite(LL)) (2 * k_par - 2 * LL) else NA_real_
+
+# Derived quantities
+half_life_years <- log(2) / theta_hat$kappa
+half_life_weeks <- 52 * half_life_years
+
+lambda_xi_implied <- if (!is.null(theta_hat$lambda_xi_implied)) {
+  theta_hat$lambda_xi_implied
+} else {
+  theta_hat$mu - theta_hat$mu_star
+}
+
+# Compact output tables
+summary_tbl <- tibble(
+  metric = c("logLik", "AIC", "n_params", "n_maturities", "n_obs",
+             "half_life_years", "half_life_weeks",
+             "mu", "mu_star", "lambda_xi_implied", "rho"),
+  value  = c(LL, AIC, k_par, n_mat, T_len,
+             half_life_years, half_life_weeks,
+             theta_hat$mu, theta_hat$mu_star, lambda_xi_implied, theta_hat$rho)
+)
+
+params_tbl <- tibble(
+  parameter = c("kappa", "sigma_chi", "sigma_xi", "rho",
+                "mu", "mu_star", "lambda_chi", "lambda_xi_implied"),
+  estimate  = c(theta_hat$kappa, theta_hat$sigma_chi, theta_hat$sigma_xi, theta_hat$rho,
+                theta_hat$mu, theta_hat$mu_star, theta_hat$lambda_chi, lambda_xi_implied)
+)
+
+maturity_months <- c(1, 5, 9, 13, 17)
+
+stopifnot(length(theta_hat$sigma_obs_vec) == length(maturity_months))
+
+sigma_obs_tbl <- tibble(
+  maturity_months = maturity_months,
+  sigma_obs       = as.numeric(theta_hat$sigma_obs_vec)
+)
+
+
+print(summary_tbl)
+print(params_tbl)
+print(sigma_obs_tbl)
+
+```
+
+## Step 2: Standard Errors and Statistical Uncertainty of Model Parameters
+
+This step assesses the statistical precision of the estimated parameters of the Schwartz–Smith (2000) two-factor model. While Step 1 documented point estimates and implied quantities, Step 2 focuses on quantifying estimation uncertainty using standard errors and confidence intervals. This analysis corresponds conceptually to the statistical interpretation of parameter estimates in Schwartz and Smith (2000), although the original paper does not explicitly report full covariance matrices.
+
+Standard errors are obtained from the inverse Hessian of the log-likelihood function evaluated at the maximum likelihood estimates. Because the model is estimated in a transformed (packed) parameter space to enforce parameter constraints, the covariance matrix is mapped back to economically meaningful parameters using the delta method. This ensures that uncertainty measures are fully consistent with the estimation methodology and the nonlinear parameter transformations used in the model.
+
+The results indicate that the core structural parameters of the model are estimated with high precision. In particular, the speed of mean reversion of the short-term deviation factor is tightly identified, leading to a precisely estimated half-life of approximately 43 weeks with a narrow confidence interval. The volatility parameters of both the short-term and long-term factors are also estimated precisely, reflecting the strong information content of the futures term structure over the long sample period. In contrast, the market price of risk parameters exhibit substantially higher uncertainty. The confidence intervals for both the short-term and long-term risk premia include zero, consistent with the identification challenges emphasized in Schwartz and Smith (2000).
+
+Measurement error standard deviations are estimated very precisely for short- and medium-dated contracts, and remain small for longer maturities. The strong decline in measurement error with maturity is statistically robust and reinforces the interpretation that longer-dated futures prices primarily reflect the persistent equilibrium component rather than short-term fluctuations. Overall, the precision results confirm that the main dynamic features of the Schwartz–Smith model are well identified in the data, while risk-premium parameters are more weakly determined, in line with the original paper’s discussion.
+
+```{r step2}
+# --- 1) Numerical Hessian of NEGATIVE log-likelihood at optimum ------------ #
+# In S&S 2000 Full Timeline: loglik(p, Y, Tau, Delta_t) returns NEGATIVE log-likelihood.
+H <- numDeriv::hessian(
+  func = function(p) loglik(p, Y = Y, Tau = Tau, Delta_t = Delta_t),
+  x    = best$par
+)
+
+# Symmetrize to reduce numerical jitter
+H <- 0.5 * (H + t(H))
+
+# --- 2) Invert Hessian -> covariance of packed parameters ------------------ #
+vcov_packed <- tryCatch(solve(H), error = function(e) NULL)
+if (is.null(vcov_packed)) {
+  message("Hessian near-singular; using MASS::ginv pseudoinverse.")
+  vcov_packed <- MASS::ginv(H)
+}
+
+# --- 3) Map packed parameters -> natural parameters (via unpack) ----------- #
+# This uses the unpack() function from S&S 2000 Full Timeline to ensure consistency.
+nat_from_p <- function(p) {
+  th <- unpack(p)
+  c(
+    kappa      = th$kappa,
+    sigma_chi  = th$sigma_chi,
+    sigma_xi   = th$sigma_xi,
+    rho        = th$rho,
+    mu         = th$mu,
+    mu_star    = th$mu_star,
+    lambda_chi = th$lambda_chi,
+    lambda_xi  = th$mu - th$mu_star,          # implied in SS2000
+    sigma_obs_1  = th$sigma_obs_vec[1],
+    sigma_obs_2  = th$sigma_obs_vec[2],
+    sigma_obs_3  = th$sigma_obs_vec[3],
+    sigma_obs_4  = th$sigma_obs_vec[4],
+    sigma_obs_5  = th$sigma_obs_vec[5]
+  )
+}
+
+p_hat   <- best$par
+nat_hat <- nat_from_p(p_hat)
+
+# --- 4) Jacobian: d(natural) / d(packed) ---------------------------------- #
+G <- numDeriv::jacobian(func = nat_from_p, x = p_hat)
+
+# --- 5) Delta-method covariance in natural space -------------------------- #
+vcov_nat <- G %*% vcov_packed %*% t(G)
+
+rn <- names(nat_hat)
+dimnames(vcov_nat) <- list(rn, rn)
+
+se_nat <- sqrt(pmax(diag(vcov_nat), 0))  # guard against tiny negative diag
+z <- qnorm(0.975)
+
+parameter_se <- tibble(
+  parameter = rn,
+  estimate  = as.numeric(nat_hat),
+  se        = as.numeric(se_nat),
+  ci95_lo   = as.numeric(nat_hat - z * se_nat),
+  ci95_hi   = as.numeric(nat_hat + z * se_nat)
+)
+
+# --- 6) Derived quantity: half-life of mean reversion ---------------------- #
+# half_life_years = ln(2)/kappa
+var_kappa <- vcov_nat["kappa", "kappa"]
+
+half_life_years <- log(2) / nat_hat["kappa"]
+dh_dkappa <- -log(2) / (nat_hat["kappa"]^2)
+
+half_life_se_years <- abs(dh_dkappa) * sqrt(max(var_kappa, 0))
+
+derived_se <- tibble(
+  derived  = c("half_life_years", "half_life_weeks", "mu", "mu_star", "lambda_xi"),
+  estimate = c(as.numeric(half_life_years),
+               as.numeric(half_life_years * 52),
+               nat_hat["mu"], nat_hat["mu_star"], nat_hat["lambda_xi"]),
+  se       = c(as.numeric(half_life_se_years),
+               as.numeric(half_life_se_years * 52),
+               se_nat[match("mu", rn)],
+               se_nat[match("mu_star", rn)],
+               se_nat[match("lambda_xi", rn)]),
+  ci95_lo  = c(as.numeric(half_life_years - z * half_life_se_years),
+               as.numeric((half_life_years - z * half_life_se_years) * 52),
+               nat_hat["mu"] - z * se_nat[match("mu", rn)],
+               nat_hat["mu_star"] - z * se_nat[match("mu_star", rn)],
+               nat_hat["lambda_xi"] - z * se_nat[match("lambda_xi", rn)]),
+  ci95_hi  = c(as.numeric(half_life_years + z * half_life_se_years),
+               as.numeric((half_life_years + z * half_life_se_years) * 52),
+               nat_hat["mu"] + z * se_nat[match("mu", rn)],
+               nat_hat["mu_star"] + z * se_nat[match("mu_star", rn)],
+               nat_hat["lambda_xi"] + z * se_nat[match("lambda_xi", rn)])
+)
+
+# --- 7) Add SEs to Step 1 tables (if they exist) --------------------------- #
+if (exists("params_tbl") && is.data.frame(params_tbl)) {
+  params_tbl <- params_tbl %>%
+    left_join(
+      parameter_se %>%
+        filter(parameter %in% c("kappa","sigma_chi","sigma_xi","rho","mu","mu_star","lambda_chi","lambda_xi")) %>%
+        dplyr::select(parameter, std_error = se, ci95_lo, ci95_hi),
+      by = "parameter"
+    )
+}
+
+
+# Step 1 sigma_obs_tbl uses maturity_months; map it to sigma_obs_1..5
+if (exists("sigma_obs_tbl") && is.data.frame(sigma_obs_tbl)) {
+  sigma_obs_tbl <- sigma_obs_tbl %>%
+    mutate(maturity_id = row_number()) %>%
+    left_join(
+      parameter_se %>%
+        filter(grepl("^sigma_obs_", parameter)) %>%
+        mutate(maturity_id = as.integer(sub("sigma_obs_", "", parameter))) %>%
+        dplyr::select(maturity_id, std_error = se, ci95_lo, ci95_hi),
+      by = "maturity_id"
+    ) %>%
+    dplyr::select(-maturity_id)
+}
+
+# --- 8) Display ------------------------------------------------------------ #
+parameter_se
+derived_se
+if (exists("params_tbl")) params_tbl
+if (exists("sigma_obs_tbl")) sigma_obs_tbl
+
+invisible(list(
+  vcov_packed  = vcov_packed,
+  vcov_nat     = vcov_nat,
+  parameter_se = parameter_se,
+  derived_se   = derived_se,
+  params_tbl   = if (exists("params_tbl")) params_tbl else NULL,
+  sigma_obs_tbl = if (exists("sigma_obs_tbl")) sigma_obs_tbl else NULL
+))
+
+```
+
+## Step 3: Innovation and Fit Error Diagnostics Across Contract Maturities
+
+This step evaluates the in-sample fit of the estimated Schwartz–Smith (2000) model by analyzing forecast errors and fit residuals across futures maturities. While previous steps focused on parameter estimation and statistical precision, Step 3 assesses how well the model reproduces observed futures prices at different points along the term structure. This mirrors the spirit of Table 3 in Schwartz and Smith (2000), which summarizes pricing errors by maturity for futures contracts.
+
+The first part of the analysis examines one-step-ahead forecast errors (Kalman filter innovations). For each maturity, root mean squared errors (RMSE) and mean absolute errors (MAE) are computed and compared to the model-implied innovation standard deviations and the estimated measurement error variances. The results show that forecast errors decline systematically with maturity, indicating that short-dated contracts are more volatile and harder to predict, while longer-dated futures are more stable and largely driven by the persistent equilibrium component. Innovation RMSEs are closely aligned with the model-implied innovation standard deviations, suggesting that the state-space specification captures the overall scale of forecast uncertainty well.
+
+The second part of the step evaluates fit errors using filtered state estimates, corresponding to the model’s real-time fitted values. Residuals are computed as the difference between observed log futures prices and model-implied prices based on the filtered states. Across maturities, mean errors are close to zero, indicating negligible systematic bias. The dispersion and mean absolute errors are small and closely track the estimated measurement error standard deviations, consistent with the interpretation that remaining pricing errors primarily reflect measurement noise rather than model misspecification.
+
+Finally, the same fit diagnostics are repeated using smoothed state estimates, which condition on the full sample and therefore provide the best in-sample reconstruction of latent factors. As expected, smoothed-fit residuals are slightly smaller than filtered-fit residuals, while exhibiting very similar patterns across maturities. The close agreement between filtered and smoothed results confirms that the model is stable over time and that most pricing information is already incorporated contemporaneously.
+
+Overall, the in-sample diagnostics confirm that the Schwartz–Smith model provides an accurate and unbiased representation of futures prices across the term structure. Pricing errors decrease with maturity, residuals are centered around zero, and their magnitude is consistent with the estimated measurement error variances. These findings closely align with the empirical behavior reported in Schwartz and Smith (2000) and provide a solid foundation for the subsequent structural and out-of-sample analyses.
+
+```{r step3}
+#############################################################################
+# STEP 3a — RMSE by maturity (innovations)
+#############################################################################
+
+# Basic checks
+stopifnot(exists("kf_hat"), exists("Y"))
+stopifnot(is.list(kf_hat), is.matrix(Y))
+
+n_mat <- nrow(Y)   # number of maturities (rows of Y)
+T_len <- ncol(Y)   # number of time points
+
+vt <- kf_hat$vt    # one-step-ahead forecast errors (innovations)
+Ft <- kf_hat$Ft    # innovation covariance matrices
+
+# If these are missing, this whole step is meaningless
+stopifnot(!is.null(vt), !is.null(Ft))
+
+# RMSE/MAE of innovations per maturity (how large are forecast errors by row)
+RMSE_maturity <- sqrt(rowMeans(vt^2, na.rm = TRUE))
+MAE_maturity  <- rowMeans(abs(vt),  na.rm = TRUE)
+
+# Model-implied SD of innovations: sqrt(diag(F_t)), averaged over time
+innov_sd_t <- sapply(seq_len(T_len), function(tt) sqrt(diag(Ft[, , tt])))
+avg_innov_SD <- rowMeans(innov_sd_t, na.rm = TRUE)
+
+# Labels for readability (assumes the 5-contract setup)
+maturity_months <- c(1, 5, 9, 13, 17)
+stopifnot(length(maturity_months) == n_mat)  # prevents mislabeling
+
+rmse_tbl <- tibble(
+  maturity_months = maturity_months,
+  RMSE            = RMSE_maturity,
+  MAE             = MAE_maturity,
+  avg_innov_SD    = avg_innov_SD,
+  sigma_obs       = as.numeric(theta_hat$sigma_obs_vec)  # measurement noise per maturity
+)
+
+rmse_tbl
+invisible(rmse_tbl)
+
+
+#############################################################################
+# STEP 3b(i) — Fit errors using FILTERED states (x_{t|t})
+#############################################################################
+
+# Basic checks
+# - Tau and Delta_t are needed to rebuild Zt and ct if ss_hat is not in memory
+stopifnot(exists("Tau"), exists("Delta_t"))
+stopifnot(is.matrix(Tau), is.numeric(Delta_t), length(Delta_t) == 1)
+
+# Build state-space arrays (Z_t and c_t) if not already available
+# This keeps the analytics self-contained after loading the S&S 2000 Full Timeline RDS.
+if (!exists("ss_hat")) {
+  stopifnot(exists("make_ss_arrays"))
+  ss_hat <- make_ss_arrays(theta_hat, Tau, Delta_t)
+}
+
+# Filtered state estimates from the Kalman filter: x_{t|t}
+# (2 states: chi_t and xi_t)
+x_filt <- kf_hat$att
+stopifnot(!is.null(x_filt))  # without states we can't fit anything
+
+# Fitted observation using filtered states:
+# y_hat_{t|t} = c_t + Z_t * x_{t|t}
+y_hat_fit <- matrix(NA_real_, nrow = n_mat, ncol = T_len)
+for (t in seq_len(T_len)) {
+  y_hat_fit[, t] <- ss_hat$ct[, t] + ss_hat$Zt[, , t] %*% x_filt[, t]
+}
+
+# Fit residuals in log-price space (same units as Y)
+fit_resid <- Y - y_hat_fit
+
+# Summary diagnostics by maturity
+fit_mean <- rowMeans(fit_resid, na.rm = TRUE)           # average bias
+fit_sd   <- apply(fit_resid, 1, sd, na.rm = TRUE)       # dispersion
+fit_mae  <- rowMeans(abs(fit_resid), na.rm = TRUE)      # typical absolute error
+
+table3_like_filtered <- tibble(
+  maturity_months = maturity_months,
+  mean            = fit_mean,
+  sd              = fit_sd,
+  MAE             = fit_mae,
+  sigma_obs       = as.numeric(theta_hat$sigma_obs_vec)
+)
+
+table3_like_filtered
+invisible(table3_like_filtered)
+
+
+#############################################################################
+# STEP 3b(ii) — Fit errors using SMOOTHED states (x_{t|T})
+#############################################################################
+
+# Basic checks
+stopifnot(!is.null(kf_hat$Ptt), !is.null(kf_hat$Pt), !is.null(kf_hat$at))
+
+# Start smoother at filtered estimates (these will be overwritten going backwards)
+xs <- kf_hat$att
+Ps <- kf_hat$Ptt
+
+# Transition matrix for the latent state dynamics (2x2)
+G <- ss_hat$Tt[, , 1]
+
+# Rauch–Tung–Striebel smoother: backward recursion t = T-1,...,1
+for (t in (T_len - 1):1) {
+
+  Ptt_t <- kf_hat$Ptt[, , t]       # P_{t|t}
+  Pt1_t <- kf_hat$Pt [ , , t + 1]  # P_{t+1|t}
+  a_pred_next <- kf_hat$at[, t + 1]# a_{t+1|t}
+
+  # Smoother gain: J_t = P_{t|t} G' (P_{t+1|t})^{-1}
+  Jt <- tryCatch(
+    Ptt_t %*% t(G) %*% solve(Pt1_t),
+    error = function(e) Ptt_t %*% t(G) %*% MASS::ginv(Pt1_t)
+  )
+
+  # Smoothed mean update: a_{t|T}
+  xs[, t] <- kf_hat$att[, t] + Jt %*% (xs[, t + 1] - a_pred_next)
+
+  # Smoothed covariance update: P_{t|T}
+  Ps[, , t] <- Ptt_t + Jt %*% (Ps[, , t + 1] - Pt1_t) %*% t(Jt)
+}
+
+# Fitted observation using smoothed states:
+# y_hat_{t|T} = c_t + Z_t * x_{t|T}
+y_hat_sm <- matrix(NA_real_, nrow = n_mat, ncol = T_len)
+for (t in seq_len(T_len)) {
+  y_hat_sm[, t] <- ss_hat$ct[, t] + ss_hat$Zt[, , t] %*% xs[, t]
+}
+
+# Residuals using smoothed fit (typically smaller than filtered-fit residuals)
+resid_sm <- Y - y_hat_sm
+
+fit_mean_sm <- rowMeans(resid_sm, na.rm = TRUE)
+fit_sd_sm   <- apply(resid_sm, 1, sd, na.rm = TRUE)
+fit_mae_sm  <- rowMeans(abs(resid_sm), na.rm = TRUE)
+
+table3_like_smoothed <- tibble(
+  maturity_months = maturity_months,
+  mean            = fit_mean_sm,
+  sd              = fit_sd_sm,
+  MAE             = fit_mae_sm,
+  sigma_obs       = as.numeric(theta_hat$sigma_obs_vec)
+)
+
+table3_like_smoothed
+invisible(table3_like_smoothed)
+
+```
+
+## Step 4: Diagnostics of Standardized Innovations
+
+This step evaluates whether the one-step-ahead forecast errors produced by the Kalman filter behave in line with the assumptions of the Schwartz–Smith (2000) state-space model. Innovations are standardized using their model-implied conditional variances and should, under correct specification, have mean zero, unit variance, and limited serial and cross-sectional dependence.
+
+The standardized innovations exhibit means close to zero and standard deviations near one across all maturities, indicating that the model captures the scale of forecast uncertainty well and shows little systematic bias. Normality is strongly rejected for all contracts, which is typical for commodity futures data and consistent with the empirical findings in Schwartz and Smith (2000).
+
+Ljung–Box tests reveal remaining serial correlation, particularly for short maturities and at longer lags, suggesting that some short-run dynamics are not fully absorbed by the two-factor structure. In addition, standardized innovations remain strongly correlated across maturities, reflecting substantial common shocks in futures prices that are only partially captured by the latent factors.
+
+Overall, these diagnostics suggest that the model provides a reasonable but stylized representation of the data: it captures the main dynamics and volatility structure of the futures curve while leaving some residual dependence, in line with the scope and intent of the Schwartz–Smith framework.
+
+```{r step4}
+#############################################################################
+# STEP 4 — Residual diagnostics on standardized innovations
+#############################################################################
+
+# --- Inputs created upstream (S&S 2000 Full Timeline -> analytics) ----------
+vt <- kf_hat$vt   # innovations: v_{t} = y_t - E[y_t | t-1}  (maturities x time)
+Ft <- kf_hat$Ft   # innovation covariance matrices F_t       (m x m x time)
+
+# Required inputs: if these are missing, the diagnostics are not defined
+stopifnot(!is.null(vt), !is.null(Ft))
+
+n_mat <- nrow(Y)      # number of maturities (rows)
+T_len <- ncol(Y)      # number of time points (columns)
+
+# Ljung–Box at lag 20 needs a reasonable sample length
+stopifnot(T_len >= 25)
+
+# Labels only (for readable tables); keep consistent with the rest of the thesis
+maturity_months <- c(1, 5, 9, 13, 17)
+stopifnot(length(maturity_months) == n_mat)
+
+# --- 1) Standardized innovations z_{m,t} -----------------------------------
+# For each maturity m and time t:
+#   z_{m,t} = v_{m,t} / sqrt(F_{m,m,t})
+# If the model is well specified, z should look roughly like iid N(0,1).
+
+# Extract diag(F_t) for each t as an (m x T) matrix
+Ft_diag <- sapply(seq_len(dim(Ft)[3]), function(tt) diag(Ft[, , tt]))
+
+# Convert variances to standard deviations; pmax() avoids division by ~0
+innov_sd_t <- sqrt(pmax(Ft_diag, 1e-12))
+
+# Standardize the innovations maturity-by-maturity
+z <- vt / innov_sd_t
+
+# --- 2) Distribution diagnostics per maturity ------------------------------
+# mean_z ~ 0: no systematic forecast bias
+# sd_z   ~ 1: model-implied forecast-error variance matches realized variance
+# t_pval: test mean(z) = 0
+# jb_pval: Jarque–Bera normality test (often rejected in commodities; still informative)
+
+dist_tbl <- tibble(
+  maturity_months = maturity_months,
+  mean_z = rowMeans(z, na.rm = TRUE),
+  sd_z   = apply(z, 1, sd, na.rm = TRUE),
+  t_pval = sapply(seq_len(nrow(z)), function(i) t.test(z[i, ])$p.value),
+  jb_pval = sapply(seq_len(nrow(z)), function(i)
+    tryCatch(tseries::jarque.bera.test(z[i, ])$p.value, error = function(e) NA_real_))
+)
+
+# --- 3) Serial correlation diagnostics (Ljung–Box on z) ---------------------
+# Standardized innovations should be approximately uncorrelated over time
+# if the state dynamics are correctly captured.
+
+lb_tbl <- tibble(
+  maturity_months = maturity_months,
+  lb_pval_lag5  = sapply(seq_len(nrow(z)), function(i) Box.test(z[i, ], lag = 5,  type = "Ljung-Box")$p.value),
+  lb_pval_lag10 = sapply(seq_len(nrow(z)), function(i) Box.test(z[i, ], lag = 10, type = "Ljung-Box")$p.value),
+  lb_pval_lag20 = sapply(seq_len(nrow(z)), function(i) Box.test(z[i, ], lag = 20, type = "Ljung-Box")$p.value)
+)
+
+# --- 4) Cross-maturity correlation diagnostics -----------------------------
+# After accounting for the two factors, residual shocks should ideally be weakly
+# correlated across maturities. Large off-diagonals suggest remaining common shocks
+# not captured by the model/measurement structure.
+
+cor_z <- cor(t(z), use = "pairwise.complete.obs")   # maturity x maturity correlation
+offdiag <- cor_z[upper.tri(cor_z)]
+
+cross_summary <- tibble(
+  stat  = c("mean_abs_offdiag", "max_abs_offdiag"),
+  value = c(mean(abs(offdiag), na.rm = TRUE), max(abs(offdiag), na.rm = TRUE))
+)
+
+# --- 5) Display outputs -----------------------------------------------------
+
+dist_tbl
+lb_tbl
+cor_z
+cross_summary
+
+invisible(list(
+  standardized_innovations_summary = dist_tbl,
+  ljung_box_pvalues                = lb_tbl,
+  cross_maturity_correlation       = cor_z,
+  cross_maturity_summary           = cross_summary,
+  z                                = z   # return standardized innovations for later plots/tests
+))
+
+```
+
+## Step 5:Model-Implied Spot and Equilibrium Price Dynamics
+
+This step illustrates the core economic decomposition of the Schwartz–Smith (2000) model by separating the spot price into a transitory short-term component and a persistent long-term equilibrium component. Using smoothed state estimates from the Kalman smoother, the equilibrium price is constructed from the long-term factor alone, while the model-implied spot price combines both latent factors. This corresponds directly to Figure 4 in Schwartz and Smith (2000).
+
+The resulting figure shows that short-term price fluctuations are large but short-lived, while the equilibrium price evolves smoothly over time, capturing gradual shifts in long-run fundamentals. Periods of sharp price spikes are therefore primarily driven by the short-term factor, whereas longer-run movements reflect changes in the equilibrium level. Overall, the decomposition closely mirrors the dynamics documented in the original paper and confirms the economic interpretation of the two-factor structure.
+
+```{r step5}
+#############################################################################
+# STEP 5 — Spot vs Equilibrium (Figure 4 style)
+#############################################################################
+
+# --- 0) Inputs and time index ------------------------------------------------
+
+stopifnot(exists("kf_hat"), is.list(kf_hat), !is.null(kf_hat$att))
+stopifnot(is.matrix(kf_hat$att), nrow(kf_hat$att) == 2)
+
+T_len <- ncol(kf_hat$att)
+
+# Use obs_dates from S&S 2000 Full Timeline if available; otherwise fall back to 1..T
+dates <- if (exists("obs_dates")) {
+  d <- as.Date(obs_dates)
+  if (length(d) != T_len) d <- tail(d, T_len)  # align if needed
+  d
+} else {
+  seq_len(T_len)
+}
+
+# --- 1) RTS smoothing (compute xs only if missing) --------------------------
+
+# We want smoothed states x_{t|T}. If xs already exists, we reuse it.
+if (!exists("xs")) {
+
+  # FKF objects needed for RTS recursion
+  stopifnot(!is.null(kf_hat$Ptt), !is.null(kf_hat$Pt), !is.null(kf_hat$at))
+  stopifnot(exists("ss_hat"), is.list(ss_hat), !is.null(ss_hat$Tt))
+
+  xs <- kf_hat$att              # start from filtered state means x_{t|t}
+  Ps <- kf_hat$Ptt              # and filtered covariances P_{t|t}
+  G  <- ss_hat$Tt[, , 1]        # state transition matrix (2x2), time-invariant here
+
+  # Backward recursion: t = T-1, ..., 1
+  for (t in (T_len - 1):1) {
+
+    Ptt_t <- kf_hat$Ptt[, , t]        # P_{t|t}
+    Pt1_t <- kf_hat$Pt [ , , t + 1]   # P_{t+1|t}
+    a_pred_next <- kf_hat$at[, t + 1] # a_{t+1|t}
+
+    # Smoother gain J_t = P_{t|t} G' (P_{t+1|t})^{-1}
+    Jt <- tryCatch(
+      Ptt_t %*% t(G) %*% solve(Pt1_t),
+      error = function(e) Ptt_t %*% t(G) %*% MASS::ginv(Pt1_t)
+    )
+
+    # Smoothed mean: a_{t|T} = a_{t|t} + J_t (a_{t+1|T} - a_{t+1|t})
+    xs[, t] <- kf_hat$att[, t] + Jt %*% (xs[, t + 1] - a_pred_next)
+
+    # Smoothed covariance: P_{t|T} = P_{t|t} + J_t (P_{t+1|T} - P_{t+1|t}) J_t'
+    Ps[, , t] <- Ptt_t + Jt %*% (Ps[, , t + 1] - Pt1_t) %*% t(Jt)
+  }
+}
+
+# --- 2) Construct equilibrium and spot in levels ----------------------------
+
+chi_sm <- as.numeric(xs[1, ])            # chi_t (short-term deviation)
+xi_sm  <- as.numeric(xs[2, ])            # xi_t  (equilibrium level)
+
+df_fig <- tibble(
+  time     = dates,
+  eq_price = exp(xi_sm),                 # equilibrium component = exp(xi_t)
+  spot_est = exp(xi_sm + chi_sm)         # spot estimate        = exp(xi_t + chi_t)
+)
+
+# --- 3) Reshape and plot -----------------------------------------------------
+# Build plotting data (long format) for ggplot
+plot_df <- df_fig %>%
+  tidyr::pivot_longer(
+    cols = c(spot_est, eq_price),
+    names_to = "series",
+    values_to = "price"
+  ) %>%
+  dplyr::mutate(
+    series = factor(
+      series,
+      levels = c("spot_est", "eq_price"),
+      labels = c("Spot (model)", "Equilibrium (model)")
+    )
+  )
+
+p_fig <- ggplot(plot_df, aes(x = time, y = price)) +
+  geom_line(
+    data = subset(plot_df, series == "Spot (model)"),
+    aes(colour = "Spot (model)", linetype = "Spot (model)"),
+    linewidth = 0.9   # ↑ larger dots
+  ) +
+  geom_line(
+    data = subset(plot_df, series == "Equilibrium (model)"),
+    aes(colour = "Equilibrium (model)", linetype = "Equilibrium (model)"),
+    linewidth = 0.8
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Spot (model)" = "black",
+      "Equilibrium (model)" = "black"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Spot (model)" = "dotted",
+      "Equilibrium (model)" = "solid"
+    )
+  ) +
+  labs(
+    title = "Model-implied Spot vs Equilibrium Price",
+    x = NULL,
+    y = "Price (levels)",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 9)
+  )
+
+p_fig
+
+```
+
+## Step 6: Pricing Identity and Futures Curve Overlay
+
+This step evaluates the internal pricing consistency of the estimated Schwartz–Smith (2000) model by directly comparing observed futures prices to model-implied prices across maturities and time. Rather than focusing on time-series fit alone, this analysis assesses whether the estimated latent factors and parameters can accurately reconstruct the cross-sectional shape of the futures curve, which is a central implication of the model’s no-arbitrage pricing structure.
+
+Using the smoothed state estimates of the short-term deviation and long-term equilibrium components, the model-implied futures curve is reconstructed analytically for selected weeks. Smoothed states condition on the full sample of observations and therefore provide the statistically most precise reconstruction of the underlying latent price components implied by the model. Their use is appropriate in this context, as the objective is not real-time forecasting but the economic interpretation and internal consistency of the estimated pricing structure.
+
+For each date, observed futures prices at traded maturities are overlaid with (i) the model-implied prices at those maturities and (ii) a smooth model-implied curve evaluated over a dense maturity grid. This corresponds closely to the pricing identity discussed in Schwartz and Smith (2000) and provides a stringent economic validation of the estimated model. In addition to the smoothed-state analysis, the same overlays are constructed using filtered state estimates, which condition only on information available up to each date but rely on the same full-sample parameter estimates. Comparing filtered and smoothed reconstructions allows for an assessment of how strongly future observations revise the inferred latent states, holding the model parameters fixed. The resulting curves are visually very similar, indicating that the cross-section of futures prices already pins down the latent factors tightly in real time, with limited additional revision from future data.
+
+The broad-sweep panels show that the model captures the overall level, slope, and curvature of the futures curve well across different market regimes, including periods of contango and backwardation. Even over the extended sample period, the fitted curves closely track observed prices, indicating that the estimated factor dynamics translate consistently into cross-sectional pricing implications.
+
+The focused-episode panels highlight the model’s performance during periods of heightened market stress and structural change, such as the early 2000s, the Global Financial Crisis, the COVID-19 shock, and recent energy market disruptions. While small deviations at short maturities occasionally arise, the model continues to reproduce the dominant shape of the futures curve, suggesting that most pricing variation is captured by the two latent factors.
+
+Overall, these results confirm that the estimated Schwartz–Smith model is internally coherent from a pricing perspective. The same parameters and latent factor structure that explain time-series dynamics also generate economically sensible futures curves across a wide range of maturities and market conditions, closely mirroring the behavior documented in the original paper.
+
+```{r step6}
+#############################################################################
+# STEP 6 — SmoothedStates 
+#############################################################################
+
+# --- 0) Small utilities -----------------------------------------------------#
+# Ensure smoothed states xs (2×T) and aligned date vector
+.ensure_smoothed <- function() {
+  stopifnot(exists("kf_hat"), exists("ss_hat"), is.matrix(kf_hat$att))
+  T_len <- ncol(kf_hat$att)
+  # Dates: prefer obs_dates; fallback = colnames(Y); else integer index
+  dates <- NULL
+  if (exists("obs_dates")) {
+    dates <- as.Date(obs_dates); dates <- tail(dates, T_len)
+  } else if (exists("Y") && !is.null(colnames(Y))) {
+    try_dates <- try(as.Date(colnames(Y)), silent = TRUE)
+    if (!inherits(try_dates, "try-error") && !any(is.na(try_dates)))
+      dates <- tail(try_dates, T_len)
+  }
+  if (is.null(dates)) dates <- seq_len(T_len)
+  
+  if (!exists("xs")) {
+    xs <<- kf_hat$att
+    Ps <- kf_hat$Ptt
+    G  <- ss_hat$Tt[, , 1]
+    for (t in (T_len - 1):1) {
+      Ptt_t <- kf_hat$Ptt[, , t]
+      Pt1_t <- kf_hat$Pt [ , , t + 1]
+      Jt <- tryCatch(Ptt_t %*% t(G) %*% solve(Pt1_t),
+                     error = function(e) Ptt_t %*% t(G) %*% MASS::ginv(Pt1_t))
+      a_pred_next <- kf_hat$at[, t + 1]
+      xs[, t]   <<- kf_hat$att[, t] + Jt %*% (xs[, t + 1] - a_pred_next)
+      Ps[, , t] <- Ptt_t + Jt %*% (Ps[, , t + 1] - Pt1_t) %*% t(Jt)
+    }
+  }
+  list(dates = dates, T_len = T_len)
+}
+
+# One overlay (observed vs model) for time index t_idx
+.overlay_plot_idx <- function(t_idx, in_levels = FALSE) {
+  h <- .ensure_smoothed(); dates <- h$dates; T_len <- h$T_len
+  stopifnot(t_idx >= 1, t_idx <= T_len)
+  m  <- if (exists("Y") && is.matrix(Y)) nrow(Y) else dim(ss_hat$Zt)[1]
+  
+  chi_t <- xs[1, t_idx]; xi_t <- xs[2, t_idx]
+  Z_t <- ss_hat$Zt[, , t_idx]; c_t <- ss_hat$ct[, t_idx]
+  y_hat_log <- as.numeric(c_t + Z_t %*% c(chi_t, xi_t))
+  y_obs_log <- as.numeric(Y[, t_idx])
+  
+  # τ for x-axis
+  tau_pts <- if (exists("Tau") && is.matrix(Tau) && ncol(Tau) >= t_idx) Tau[, t_idx]
+  else if (exists("ranks")) ranks/12 else seq_len(m)/12
+  
+  # Smooth model curve via A_fun (from base)
+  tau_grid <- seq(0, max(tau_pts, na.rm = TRUE), length.out = 200)
+  A_grid <- A_fun(
+    T         = tau_grid,
+    kappa     = theta_hat$kappa,
+    mu_star   = theta_hat$mu_star,
+    sigma_chi = theta_hat$sigma_chi,
+    sigma_xi  = theta_hat$sigma_xi,
+    rho       = theta_hat$rho,
+    lambda_chi= theta_hat$lambda_chi
+  )
+  y_grid_log <- A_grid + exp(-theta_hat$kappa * tau_grid) * chi_t + xi_t
+  
+  if (isTRUE(in_levels)) {
+    y_obs <- exp(y_obs_log); y_hat <- exp(y_hat_log); y_line <- exp(y_grid_log); ylab <- "Price (levels)"
+  } else {
+    y_obs <- y_obs_log;      y_hat <- y_hat_log;      y_line <- y_grid_log;      ylab <- "log price"
+  }
+  
+  df_pts  <- tibble(maturity_m = 12 * tau_pts, observed = y_obs, model = y_hat)
+  df_line <- tibble(maturity_m = 12 * tau_grid, model = y_line)
+  
+  ggplot() +
+    geom_line(data = df_line, aes(maturity_m, model), colour = "black", linewidth = 0.9) +
+    geom_point(data = df_pts,  aes(maturity_m, observed),
+               shape = 21, fill = "white", colour = "black", size = 2.6, stroke = 0.9) +
+    geom_point(data = df_pts,  aes(maturity_m, model),
+               shape = 19, colour = "black", size = 1.8) +
+    labs(title = format(dates[t_idx], "%d %b %Y"),
+         x = "Maturity (months)", y = ylab) +
+    theme_classic(base_size = 10)
+}
+
+# Pick N indices evenly spaced inside [from, to]
+.pick_spaced <- function(from, to, n = 6) {
+  h <- .ensure_smoothed(); dates <- h$dates
+  from <- as.Date(from); to <- as.Date(to)
+  idx <- which(dates >= from & dates <= to)
+  if (!length(idx)) return(integer(0))
+  if (length(idx) <= n) return(idx)
+  unique(round(seq(min(idx), max(idx), length.out = n)))
+}
+
+# Pick nearest to fixed mm-dd in each year within [from, to] (capped to n_max)
+.pick_mmdd <- function(from, to, mm = 6, dd = 15, n_max = 6) {
+  h <- .ensure_smoothed(); dates <- h$dates
+  from <- as.Date(from); to <- as.Date(to)
+  yrs <- intersect(unique(year(dates)), year(from):year(to))
+  idx <- integer(0)
+  for (yy in yrs) {
+    target <- as.Date(sprintf("%04d-%02d-%02d", yy, mm, dd))
+    cand   <- which(year(dates) == yy)
+    if (length(cand)) idx <- c(idx, cand[ which.min(abs(dates[cand] - target)) ])
+  }
+  if (length(idx) > n_max) idx <- unique(round(seq(min(idx), max(idx), length.out = n_max)))
+  idx
+}
+
+# Draw a grid of overlays; print to screen; optionally save if savepath is given
+.print_grid <- function(idx, title = NULL, ncol = 3, in_levels = FALSE, savepath = NULL) {
+  plots <- lapply(idx, function(i) .overlay_plot_idx(i, in_levels = in_levels))
+  if (length(plots) == 0) stop("No plots to show for the chosen window.")
+  grid <- cowplot::plot_grid(plotlist = plots, ncol = ncol)
+  fig  <- if (!is.null(title)) {
+    top <- cowplot::ggdraw() + cowplot::draw_label(title, fontface = "bold", x = 0, hjust = 0)
+    cowplot::plot_grid(top, grid, ncol = 1, rel_heights = c(0.08, 0.92))
+  } else grid
+  print(fig)
+  if (!is.null(savepath)) {
+    dir.create(dirname(savepath), recursive = TRUE, showWarnings = FALSE)
+    ggsave(savepath, fig, width = 14, height = max(6, ceiling(length(plots)/ncol)*2.2), dpi = 300)
+  }
+  invisible(fig)
+}
+
+# --- 1) Two ready-made 6-panel sets ----------------------------------------#
+
+# Set A: broad sweep (one representative week per subperiod)
+plot_set_A <- function(in_levels = FALSE, savepath = NULL) {
+  windows <- list(
+    c("1990-01-01","1994-12-31"),
+    c("1995-01-01","1999-12-31"),
+    c("2000-01-01","2004-12-31"),
+    c("2005-01-01","2009-12-31"),
+    c("2010-01-01","2014-12-31"),
+    c("2015-01-01","2019-12-31")
+  )
+  idx <- unlist(lapply(windows, function(w) .pick_spaced(w[1], w[2], n = 1)))
+  .print_grid(idx, title = "Observed vs Model — Broad Sweep (1990→2019)",
+              ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+# Set B: focused/modern episodes (one representative per window, near mid-year)
+plot_set_B <- function(in_levels = FALSE, savepath = NULL) {
+  windows <- list(
+    c("2000-01-01","2002-12-31"),
+    c("2008-01-01","2009-12-31"),
+    c("2014-06-01","2016-12-31"),
+    c("2020-01-01","2021-12-31"),
+    c("2022-01-01","2023-12-31"),
+    c("2024-01-01", as.character(max(.ensure_smoothed()$dates)))
+  )
+  idx <- unlist(lapply(windows, function(w) .pick_mmdd(w[1], w[2], mm = 6, dd = 15, n_max = 1)))
+  .print_grid(idx, title = "Observed vs Model — Focused Episodes",
+              ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+# --- 2) Custom 6-panel helpers ---------------------------------------------#
+
+# One window → 6 panels (evenly spaced or one per year near mm-dd)
+plot_window6 <- function(from, to, picker = c("spaced","mmdd"),
+                         in_levels = FALSE, savepath = NULL) {
+  picker <- match.arg(picker)
+  idx <- if (picker == "spaced") .pick_spaced(from, to, n = 6)
+  else .pick_mmdd(from, to, n_max = 6)
+  .print_grid(idx, title = sprintf("Observed vs Model — %s to %s", from, to),
+              ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+# Six explicit dates or numeric indices → 6 panels
+plot_dates6 <- function(dates_or_indices, in_levels = FALSE, savepath = NULL) {
+  h <- .ensure_smoothed(); dates <- h$dates
+  idx <- sapply(dates_or_indices, function(x) {
+    if (is.numeric(x)) as.integer(x) else which.min(abs(dates - as.Date(x)))
+  })
+  .print_grid(idx, title = "Observed vs Model — Selected Weeks",
+              ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+# --- 3) A couple of extra long-sample visuals (optional) -------------------#
+
+# States over time (χ_t and ξ_t; log levels by default)
+plot_states_long <- function(in_levels = FALSE) {
+  h <- .ensure_smoothed(); dates <- h$dates
+  chi <- as.numeric(xs[1, ]); xi <- as.numeric(xs[2, ])
+  df <- tibble(date = dates,
+               chi  = if (in_levels) exp(chi) else chi,
+               xi   = if (in_levels) exp(xi)  else xi) |>
+    pivot_longer(-date, names_to = "state", values_to = "value")
+  ggplot(df, aes(date, value, color = state)) +
+    geom_line(linewidth = 0.7, show.legend = TRUE) +
+    scale_color_manual(values = c("black","grey40"), labels = c("Short-term χₜ","Equilibrium ξₜ")) +
+    labs(title = "State Dynamics", x = NULL, y = if (in_levels) "Level" else "Log level", color = NULL) +
+    theme_classic()
+}
+
+# Rolling 1-step RMSE by maturity (default 52-week window) using innovations
+plot_rolling_rmse <- function(window_weeks = 52) {
+  stopifnot(is.matrix(kf_hat$vt))
+  h <- .ensure_smoothed(); dates <- h$dates
+  m <- nrow(kf_hat$vt)
+   mats_raw <- if (exists("ranks") && length(ranks) == m) paste0(ranks, "m") else paste0(seq_len(m), "m")
+  mats <- factor(mats_raw, levels = mats_raw)
+  vt <- kf_hat$vt
+  roll <- function(x, k) {
+    n <- length(x); out <- rep(NA_real_, n)
+    for (i in seq_len(n)) {
+      j0 <- max(1, i - k + 1); jj <- j0:i
+      out[i] <- sqrt(mean(x[jj]^2, na.rm = TRUE))
+    }
+    out
+  }
+  df <- lapply(1:m, function(i) tibble(date = dates, maturity = mats[i], RMSE = roll(vt[i, ], window_weeks))) |>
+    bind_rows()
+  ggplot(df, aes(date, RMSE)) +
+    geom_line(linewidth = 0.6, colour = "black") +
+    facet_wrap(~ maturity, scales = "free_y") +
+    labs(title = sprintf("Rolling %d-week RMSE of Innovations by Maturity", window_weeks),
+         x = NULL, y = "RMSE (log units)") +
+    theme_classic()
+}
+
+# --- Create the example figures ---------------------------------------------#
+plot_set_A()                                  # 6 panels, 1990→2019 sweep
+plot_set_B()                                  # 6 panels, focused episodes
+plot_window6("1990-01-01","1994-12-31")       # custom window (1990-1994)
+plot_dates6(c("1991-01-16","1998-09-16","2008-09-17","2015-01-14","2020-04-22","2022-03-09"))
+print(plot_states_long())                      # χ_t & ξ_t over time
+ranks <- c(1, 5, 9, 13, 17)
+print(plot_rolling_rmse())
+rm(ranks)
+
+
+#############################################################################
+# STEP 6.1 — Filtered States
+#############################################################################
+
+#############################################################################
+# STEP 6 (ADD-ON) — FILTERED states x_{t|t} overlays (self-contained)
+#############################################################################
+
+# --- A) Ensure filtered states exist (xf = kf_hat$att) ----------------------#
+.ensure_filtered_states <- function() {
+  stopifnot(exists("kf_hat"), is.matrix(kf_hat$att))
+  T_len <- ncol(kf_hat$att)
+  stopifnot(T_len > 0)
+
+  # Dates: prefer obs_dates; fallback = colnames(Y); else integer index
+  dates <- NULL
+  if (exists("obs_dates")) {
+    dates <- as.Date(obs_dates); dates <- tail(dates, T_len)
+  } else if (exists("Y") && !is.null(colnames(Y))) {
+    try_dates <- try(as.Date(colnames(Y)), silent = TRUE)
+    if (!inherits(try_dates, "try-error") && !any(is.na(try_dates)))
+      dates <- tail(try_dates, T_len)
+  }
+  if (is.null(dates)) dates <- seq_len(T_len)
+
+  list(xf = kf_hat$att, dates = dates, T_len = T_len)
+}
+
+# --- B) Pickers (use FILTERED dates, not smoothed) --------------------------#
+.pick_spaced_filt <- function(from, to, n = 6) {
+  h <- .ensure_filtered_states(); dates <- h$dates
+  if (!inherits(dates, "Date")) stop("Filtered picker needs real Date index (obs_dates or Date colnames(Y)).")
+
+  from <- as.Date(from); to <- as.Date(to)
+  idx <- which(dates >= from & dates <= to)
+  if (!length(idx)) return(integer(0))
+  if (length(idx) <= n) return(idx)
+  unique(round(seq(min(idx), max(idx), length.out = n)))
+}
+
+.pick_mmdd_filt <- function(from, to, mm = 6, dd = 15, n_max = 6) {
+  h <- .ensure_filtered_states(); dates <- h$dates
+  if (!inherits(dates, "Date")) stop("Filtered picker needs real Date index (obs_dates or Date colnames(Y)).")
+
+  from <- as.Date(from); to <- as.Date(to)
+  yrs  <- intersect(unique(lubridate::year(dates)), lubridate::year(from):lubridate::year(to))
+  idx  <- integer(0)
+
+  for (yy in yrs) {
+    target <- as.Date(sprintf("%04d-%02d-%02d", yy, mm, dd))
+    cand   <- which(lubridate::year(dates) == yy)
+    if (length(cand)) idx <- c(idx, cand[ which.min(abs(dates[cand] - target)) ])
+  }
+  if (length(idx) > n_max) idx <- unique(round(seq(min(idx), max(idx), length.out = n_max)))
+  idx
+}
+
+# --- C) One overlay at t_idx using FILTERED states --------------------------#
+.overlay_plot_idx_filt <- function(t_idx, in_levels = FALSE) {
+  h <- .ensure_filtered_states()
+  xf <- h$xf; dates <- h$dates; T_len <- h$T_len
+  stopifnot(t_idx >= 1, t_idx <= T_len)
+
+  m  <- if (exists("Y") && is.matrix(Y)) nrow(Y) else dim(ss_hat$Zt)[1]
+
+  chi_t <- xf[1, t_idx]
+  xi_t  <- xf[2, t_idx]
+
+  Z_t <- ss_hat$Zt[, , t_idx]
+  c_t <- ss_hat$ct[, t_idx]
+  y_hat_log <- as.numeric(c_t + Z_t %*% c(chi_t, xi_t))
+  y_obs_log <- as.numeric(Y[, t_idx])
+
+  tau_pts <- if (exists("Tau") && is.matrix(Tau) && ncol(Tau) >= t_idx) Tau[, t_idx]
+  else if (exists("ranks")) ranks/12 else seq_len(m)/12
+
+  tau_grid <- seq(0, max(tau_pts, na.rm = TRUE), length.out = 200)
+  A_grid <- A_fun(
+    T          = tau_grid,
+    kappa      = theta_hat$kappa,
+    mu_star    = theta_hat$mu_star,
+    sigma_chi  = theta_hat$sigma_chi,
+    sigma_xi   = theta_hat$sigma_xi,
+    rho        = theta_hat$rho,
+    lambda_chi = theta_hat$lambda_chi
+  )
+  y_grid_log <- A_grid + exp(-theta_hat$kappa * tau_grid) * chi_t + xi_t
+
+  if (isTRUE(in_levels)) {
+    y_obs  <- exp(y_obs_log); y_hat <- exp(y_hat_log); y_line <- exp(y_grid_log); ylab <- "Price (levels)"
+  } else {
+    y_obs  <- y_obs_log;      y_hat <- y_hat_log;      y_line <- y_grid_log;      ylab <- "log price"
+  }
+
+  df_pts  <- tibble::tibble(maturity_m = 12 * tau_pts, observed = y_obs, model = y_hat)
+  df_line <- tibble::tibble(maturity_m = 12 * tau_grid, model = y_line)
+
+  ggplot2::ggplot() +
+    ggplot2::geom_line(data = df_line, ggplot2::aes(maturity_m, model),
+                       colour = "black", linewidth = 0.9) +
+    ggplot2::geom_point(data = df_pts, ggplot2::aes(maturity_m, observed),
+                        shape = 21, fill = "white", colour = "black",
+                        size = 2.6, stroke = 0.9) +
+    ggplot2::geom_point(data = df_pts, ggplot2::aes(maturity_m, model),
+                        shape = 19, colour = "black", size = 1.8) +
+    ggplot2::labs(
+      title = paste0(format(dates[t_idx], "%d %b %Y"), "  (Filtered states)"),
+      x = "Maturity (months)", y = ylab
+    ) +
+    ggplot2::theme_classic(base_size = 10)
+}
+
+# --- D) Print grid for FILTERED overlays -----------------------------------#
+.print_grid_filt <- function(idx, title = NULL, ncol = 3, in_levels = FALSE, savepath = NULL) {
+  plots <- lapply(idx, function(i) .overlay_plot_idx_filt(i, in_levels = in_levels))
+  if (length(plots) == 0) stop("No plots to show for the chosen window.")
+  grid <- cowplot::plot_grid(plotlist = plots, ncol = ncol)
+  fig  <- if (!is.null(title)) {
+    top <- cowplot::ggdraw() + cowplot::draw_label(title, fontface = "bold", x = 0, hjust = 0)
+    cowplot::plot_grid(top, grid, ncol = 1, rel_heights = c(0.08, 0.92))
+  } else grid
+  print(fig)
+  if (!is.null(savepath)) {
+    dir.create(dirname(savepath), recursive = TRUE, showWarnings = FALSE)
+    ggplot2::ggsave(savepath, fig, width = 14,
+                    height = max(6, ceiling(length(plots)/ncol)*2.2), dpi = 300)
+  }
+  invisible(fig)
+}
+
+# --- E) Same predefined sets (FILTERED) ------------------------------------#
+plot_set_A_filtered <- function(in_levels = FALSE, savepath = NULL) {
+  windows <- list(
+    c("1990-01-01","1994-12-31"),
+    c("1995-01-01","1999-12-31"),
+    c("2000-01-01","2004-12-31"),
+    c("2005-01-01","2009-12-31"),
+    c("2010-01-01","2014-12-31"),
+    c("2015-01-01","2019-12-31")
+  )
+  idx <- unlist(lapply(windows, function(w) .pick_spaced_filt(w[1], w[2], n = 1)))
+  .print_grid_filt(idx, title = "Observed vs Model — Broad Sweep (Filtered states, 1990→2019)",
+                   ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+plot_set_B_filtered <- function(in_levels = FALSE, savepath = NULL) {
+  last_date <- tail(.ensure_filtered_states()$dates, 1)
+  windows <- list(
+    c("2000-01-01","2002-12-31"),
+    c("2008-01-01","2009-12-31"),
+    c("2014-06-01","2016-12-31"),
+    c("2020-01-01","2021-12-31"),
+    c("2022-01-01","2023-12-31"),
+    c("2024-01-01", as.character(last_date))
+  )
+  idx <- unlist(lapply(windows, function(w) .pick_mmdd_filt(w[1], w[2], mm = 6, dd = 15, n_max = 1)))
+  .print_grid_filt(idx, title = "Observed vs Model — Focused Episodes (Filtered states)",
+                   ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+plot_window6_filtered <- function(from, to, picker = c("spaced","mmdd"),
+                                  in_levels = FALSE, savepath = NULL) {
+  picker <- match.arg(picker)
+  idx <- if (picker == "spaced") .pick_spaced_filt(from, to, n = 6)
+  else .pick_mmdd_filt(from, to, n_max = 6)
+  .print_grid_filt(idx, title = sprintf("Observed vs Model — %s to %s (Filtered states)", from, to),
+                   ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+plot_dates6_filtered <- function(dates_or_indices, in_levels = FALSE, savepath = NULL) {
+  h <- .ensure_filtered_states(); dates <- h$dates
+  if (!inherits(dates, "Date")) stop("Need real Date index (obs_dates or Date colnames(Y)) for plot_dates6_filtered().")
+  idx <- sapply(dates_or_indices, function(x) {
+    if (is.numeric(x)) as.integer(x) else which.min(abs(dates - as.Date(x)))
+  })
+  .print_grid_filt(idx, title = "Observed vs Model — Selected Weeks (Filtered states)",
+                   ncol = 3, in_levels = in_levels, savepath = savepath)
+}
+
+# --- Quick use --------------------------------------------------------------#
+plot_set_A_filtered()
+plot_set_B_filtered()
+plot_window6_filtered("1990-01-01","1994-12-31")
+plot_dates6_filtered(c("1991-01-16","1998-09-16","2008-09-17","2015-01-14","2020-04-22","2022-03-09"))
+
+
+```
+
+## Step 7: Nested-model checks and model validation
+
+This step assesses whether all components of the two-factor Schwartz–Smith (2000) model are empirically required by estimating and comparing restricted versions of the model to the unrestricted benchmark. Rather than assuming that every parameter is necessary, the paper emphasizes testing whether specific structural features materially improve model fit.
+
+Three restricted models are considered. First, the correlation between shocks to the short-term and long-term factors is removed. Second, the market price of risk associated with the short-term factor is set to zero. Third, both restrictions are imposed simultaneously. Each restricted model is re-estimated using maximum likelihood and evaluated using likelihood-ratio tests and the Akaike Information Criterion.
+
+The results indicate that allowing for correlation between the two latent factors is important. Removing this correlation leads to a statistically significant loss in fit and a higher information criterion, confirming that short-term deviations and long-run movements in prices are linked. In contrast, setting the short-term risk premium to zero does not significantly worsen model performance, suggesting that this component plays a limited role.
+
+Overall, these findings closely match the conclusions of Schwartz and Smith (2000). The interaction between the short-term and long-term factors is a core feature of the model, while the short-term risk premium can be omitted without materially reducing explanatory power.
+
+```{r step7, warning=FALSE, message=FALSE}
+#############################################################################
+# STEP 7 — Nested-model checks (LR tests & AIC)
+#############################################################################
+
+# Required objects (created by S&S 2000 Full Timeline and loaded above) ---
+stopifnot(
+  exists("theta_hat_SS_FullTimeline_V2.0"),
+  exists("Y"), exists("Tau"), exists("Delta_t"),
+  exists("best"), is.list(best), !is.null(best$par),
+  exists("loglik"), exists("pack"), exists("unpack")
+)
+
+
+# Full-model packed parameter vector at the optimum (S&S 2000 Full Timeline)
+# best$par is the vector that was actually optimized (so it matches loglik() exactly)
+p_full_hat <- best$par
+
+# Helper: compute POSITIVE log-likelihood from a packed vector p
+# In the S&S 2000 Full Timeline convention, loglik(...) returns the NEGATIVE log-likelihood
+LL_from_p <- function(p) {
+  -as.numeric(loglik(p, Y = Y, Tau = Tau, Delta_t = Delta_t))
+}
+
+LL_full  <- LL_from_p(p_full_hat)
+k_full   <- length(p_full_hat)                # total number of estimated packed params
+AIC_full <- -2 * LL_full + 2 * k_full         # standard AIC
+
+# --- 1) Identify packed indices robustly (NO hard-coded packing order) -------
+# We locate "which element of p moves rho / lambda_chi" by small perturbations.
+# This avoids assuming any specific pack() ordering or transformation details.
+infer_p_index_for <- function(target_name, p0, eps = 1e-6) {
+  th0 <- unpack(p0)
+  stopifnot(target_name %in% names(th0))  # must be a natural parameter returned by unpack()
+
+  base_val <- th0[[target_name]]
+  deltas   <- numeric(length(p0))
+
+  for (i in seq_along(p0)) {
+    p1 <- p0
+    p1[i] <- p1[i] + eps                     # tiny bump in ONE packed coordinate
+    th1 <- unpack(p1)
+    deltas[i] <- abs(th1[[target_name]] - base_val)  # how much did the natural value move?
+  }
+
+  # If everything is ~0, something is wrong (e.g., target_name not actually linked to p)
+  if (max(deltas, na.rm = TRUE) <= 0) {
+    stop("Could not infer packed index for: ", target_name,
+         " (no sensitivity detected).")
+  }
+
+  which.max(deltas)
+}
+
+# For our Step-7 tests we need indices for rho and lambda_chi
+idx_rho        <- infer_p_index_for("rho",        p_full_hat)
+idx_lambda_chi <- infer_p_index_for("lambda_chi", p_full_hat)
+
+# --- 2) Map natural-scale "fixes" -> packed fixed values --------------------
+# Key trick:
+#   - Start from unpack(p_full_hat) (natural θ)
+#   - Overwrite θ[[name]] = target
+#   - pack(θ) gives a packed vector consistent with the parameter constraints/transforms
+#   - fixed packed value is just p_fixed[idx_*]
+packed_value_for_fix <- function(name, value, p0) {
+  th <- unpack(p0)
+  stopifnot(name %in% names(th))
+
+  # Overwrite the NATURAL parameter (e.g., rho = 0)
+  th[[name]] <- value
+
+  # Re-pack using the S&S 2000 Full Timeline pack() (so transforms are handled correctly)
+  p_new <- pack(th)
+
+  # Return both the full vector and the specific packed coordinate value
+  list(p_new = p_new, val_at = NA_real_)
+}
+
+# Convenience wrapper: return ONLY the fixed packed value at a given index
+fixed_val_at_index <- function(name, value, p0, idx) {
+  th <- unpack(p0)
+  th[[name]] <- value
+  p_new <- pack(th)
+  as.numeric(p_new[idx])
+}
+
+# --- 3) Generic restricted fit: hold selected packed indices fixed ----------
+# We keep a "template" full vector, then optimize only the FREE coordinates.
+fit_restricted <- function(fix_natural, p_start = p_full_hat) {
+  # fix_natural: named list like list(rho = 0) or list(rho = 0, lambda_chi = 0)
+  stopifnot(is.list(fix_natural), length(fix_natural) >= 1)
+
+  # Template is the full vector we will overwrite each evaluation
+  p_template <- p_start
+
+  # Build fixed-index and fixed-value vectors (packed space)
+  fixed_idx <- integer(0)
+  fixed_val <- numeric(0)
+
+  for (nm in names(fix_natural)) {
+    # Decide which packed index corresponds to this natural parameter
+    idx <- switch(
+      nm,
+      "rho"        = idx_rho,
+      "lambda_chi" = idx_lambda_chi,
+      stop("This Step 7 currently supports only fixes for: rho, lambda_chi. Got: ", nm)
+    )
+
+    # Compute the packed value consistent with setting nm to the target natural value
+    val <- fixed_val_at_index(nm, fix_natural[[nm]], p0 = p_start, idx = idx)
+
+    fixed_idx <- c(fixed_idx, idx)
+    fixed_val <- c(fixed_val, val)
+  }
+
+  fixed_idx <- as.integer(fixed_idx)
+  fixed_val <- as.numeric(fixed_val)
+
+  # FREE coordinates are everything except the fixed ones
+  free_idx <- setdiff(seq_along(p_template), fixed_idx)
+
+  # Starting point for the free vector = the full optimum restricted to free coordinates
+  p_free0 <- p_template[free_idx]
+
+  # Objective in free coordinates:
+  #   - assemble full p
+  #   - insert free values
+  #   - overwrite fixed coordinates
+  #   - return NEGATIVE logLik (because loglik() already returns neg logLik)
+  obj_free <- function(p_free) {
+    p_full <- p_template
+    p_full[free_idx]  <- p_free
+    p_full[fixed_idx] <- fixed_val
+    loglik(p_full, Y = Y, Tau = Tau, Delta_t = Delta_t)
+  }
+
+  opt <- optim(
+    par     = p_free0,
+    fn      = obj_free,
+    method  = "BFGS",
+    control = list(maxit = 4000, reltol = 1e-10)
+  )
+
+  # Reconstruct final full packed vector at restricted optimum
+  p_hat <- p_template
+  p_hat[free_idx]  <- opt$par
+  p_hat[fixed_idx] <- fixed_val
+
+  list(
+    opt       = opt,
+    p_full    = p_hat,
+    theta     = unpack(p_hat),              # natural-scale restricted estimate
+    logLik    = LL_from_p(p_hat),           # positive LL
+    k_free    = length(free_idx),           # number of FREE parameters
+    fixed     = fix_natural
+  )
+}
+
+# --- 4) Run the standard nested-model checks --------------------------------
+# R1: rho = 0            (no correlation between chi/xi innovations)
+fit_r1 <- fit_restricted(list(rho = 0))
+
+# R2: lambda_chi = 0     (no market price of risk for chi)
+fit_r2 <- fit_restricted(list(lambda_chi = 0))
+
+# R3: rho = 0 & lambda_chi = 0 (both restrictions at once)
+fit_r3 <- fit_restricted(list(rho = 0, lambda_chi = 0))
+
+# --- 5) Likelihood-ratio tests + AIC table ---------------------------------
+# LR statistic: 2*(LL_full - LL_restricted)
+# df: number of restrictions = (k_full - k_free_restricted)
+lr_row <- function(name, fit_res) {
+  LR  <- 2 * (LL_full - fit_res$logLik)
+
+  # df = (#params in full) - (#free params in restricted)
+  # because restricted model estimates only k_free parameters (the rest are fixed)
+  df  <- k_full - fit_res$k_free
+
+  p   <- pchisq(LR, df = df, lower.tail = FALSE)
+
+  tibble(
+    model   = name,
+    logLik  = fit_res$logLik,
+    k_free  = fit_res$k_free,
+    AIC     = -2 * fit_res$logLik + 2 * fit_res$k_free,
+    LR_stat = LR,
+    df      = df,
+    p_value = p
+  )
+}
+
+tab_lr <- dplyr::bind_rows(
+  tibble(
+    model   = "Full",
+    logLik  = LL_full,
+    k_free  = k_full,
+    AIC     = AIC_full,
+    LR_stat = NA_real_,
+    df      = NA_integer_,
+    p_value = NA_real_
+  ),
+  lr_row("R1: rho = 0",                    fit_r1),
+  lr_row("R2: lambda_chi = 0",             fit_r2),
+  lr_row("R3: rho = 0 & lambda_chi = 0",   fit_r3)
+)
+
+print(tab_lr)
+
+# Optional: quick view of what the restricted estimates look like (natural scale)
+print(fit_r1$theta)
+print(fit_r2$theta)
+print(fit_r3$theta)
+
+```
+
+## Step 8: Out-of-Sample One-Step-Ahead Forecast Evaluation
+
+Step 8 evaluates the out-of-sample forecasting performance of the Schwartz–Smith (2000) two-factor model in a realistic, real-time setting. The sample is split into training and test periods, where model parameters are estimated using only historical data available in the training window. The estimated parameters are then held fixed during the test window, and the Kalman filter is used to generate one-step-ahead forecasts. Forecast errors are measured by the Kalman innovations, allowing the computation of standard accuracy metrics such as RMSE and MAE across maturities. This procedure ensures that forecasting performance reflects genuine predictive power rather than in-sample fit.
+
+Methodologically, this approach closely follows the state-space framework proposed by Schwartz and Smith (2000). After estimating the model parameters via maximum likelihood on the training data, the Kalman filter is applied to infer the latent short-term and long-term factors. The filtered state at the end of the training window serves as the initial condition for forecasting in the test period. During the test window, the model updates only the latent state in response to new observations, while the structural parameters remain unchanged. This design mimics how the model would be used by a practitioner who must forecast future prices based solely on information available at the time.
+
+The results for normal market periods indicate strong out-of-sample performance and limited overfitting. In the earlier normal window, one-month contracts exhibit an out-of-sample RMSE of approximately 0.11 compared to an in-sample RMSE of about 0.07, while longer maturities show smaller errors and narrower gaps between in-sample and out-of-sample performance. In the later normal period, the difference between in-sample and out-of-sample RMSE becomes even smaller, particularly for medium and long maturities. These findings suggest that the model captures the persistent component of the futures curve effectively and that parameter estimates remain stable over time in tranquil market conditions.
+
+In contrast, the crisis-period results reveal a sharp deterioration in forecasting accuracy, especially at short maturities. For example, during the stress window, the one-month contract shows a large increase in out-of-sample RMSE relative to its in-sample counterpart, while longer maturities are less affected. This pattern is consistent with the economic structure of the Schwartz–Smith model, in which short-dated prices are dominated by transitory shocks that become highly volatile during periods of market stress. The pronounced out-of-sample errors at the front end therefore reflect genuine unpredictability rather than model misspecification.
+
+Overall, Step 8 demonstrates that the Schwartz–Smith model performs well in stable environments while transparently revealing its limitations during extreme market conditions. The out-of-sample framework confirms that the model generalizes well in normal times and that forecast errors increase in a systematic and economically interpretable way during crises. By explicitly comparing in-sample and out-of-sample performance across maturities and regimes, Step 8 provides a rigorous validation of the model’s empirical relevance and clarifies where its forecasting strengths and weaknesses lie.
+
+```{r step8, warning=FALSE, message=FALSE}
+###############################################################################
+# STEP 8 — OOS evaluation (FINAL, robust, S&S 2000 Full Timeline compatible)
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tibble)
+  library(dplyr)
+  library(purrr)
+  library(FKF)
+})
+
+
+# ============================= Preconditions ================================
+
+stopifnot(
+  exists("Y"), is.matrix(Y),
+  exists("Tau"),
+  exists("obs_dates"), length(obs_dates) == ncol(Y),
+  exists("Delta_t"), is.finite(Delta_t), Delta_t > 0
+)
+
+dates_all <- as.Date(obs_dates)
+data_lo   <- min(dates_all)
+data_hi   <- max(dates_all)
+
+mats_lab <- if (exists("ranks") && length(ranks) == nrow(Y)) {
+  paste0(ranks, "m")
+} else {
+  paste0(seq_len(nrow(Y)), "m")
+}
+
+# Ensure `contracts` exists for sample_start()
+if (!exists("contracts")) {
+  # Option A: use the canonical 5 SS(2000) contracts
+  contracts <- c("CL1 Comdty", "CL5 Comdty", "CL9 Comdty", "CL13 Comdty", "CL17 Comdty")
+}
+
+# Safety check: must match the data dimension used in training
+stopifnot(length(contracts) == nrow(Y))
+
+# ============================= Utilities ====================================
+
+clamp_window <- function(s, e) {
+  s <- max(as.Date(s), data_lo)
+  e <- min(as.Date(e), data_hi)
+  if (s > e) return(NULL)
+  c(s, e)
+}
+
+# -------- robust theta estimation: choose best numerically stable fit --------
+fit_theta_train <- function(Y_train, Tau_train,
+                            n_starts = 10, seed = 42, maxit = 400,
+                            rho_max = 0.995) {
+
+  set.seed(seed)
+  p0s <- replicate(n_starts, pack(sample_start()), simplify = FALSE)
+
+  fits <- purrr::map(p0s, function(p0) {
+    tryCatch(
+      optim(p0, fn = loglik,
+            Y = Y_train, Tau = Tau_train, Delta_t = Delta_t,
+            method = "BFGS",
+            control = list(maxit = maxit, reltol = 1e-10)),
+      error = function(e) NULL
+    )
+  })
+
+  fits <- purrr::keep(fits, ~ !is.null(.x) &&
+                        is.finite(.x$value) &&
+                        all(is.finite(.x$par)))
+
+  if (length(fits) == 0) {
+    stop("STEP 8: all optimizer starts failed (non-finite likelihood/params).",
+         call. = FALSE)
+  }
+
+  ord <- order(purrr::map_dbl(fits, "value"))
+  fits <- fits[ord]
+
+  best_abs_rho <- Inf
+
+  for (k in seq_along(fits)) {
+    theta <- tryCatch(unpack(fits[[k]]$par), error = function(e) NULL)
+    if (is.null(theta)) next
+
+    must <- c(theta$kappa, theta$sigma_chi, theta$sigma_xi, theta$rho,
+              theta$lambda_chi, theta$mu, theta$mu_star, theta$sigma_obs_vec)
+    if (!all(is.finite(as.numeric(must)))) next
+    if (theta$kappa <= 0 || theta$sigma_chi <= 0 || theta$sigma_xi <= 0) next
+    if (any(theta$sigma_obs_vec <= 0)) next
+
+    best_abs_rho <- min(best_abs_rho, abs(theta$rho))
+
+    if (abs(theta$rho) > rho_max) next
+
+    return(theta)
+  }
+
+  stop(sprintf(
+    "STEP 8: all candidate fits had |rho| > %.3f (closest |rho| = %.6f).",
+    rho_max, best_abs_rho
+  ), call. = FALSE)
+}
+
+# -------- safe prior (regression prior or diffuse fallback) ------------------
+get_prior_safe <- function(masked_train, L_use = 6) {
+  L_use <- min(L_use, ncol(masked_train$yt))
+
+  pr <- tryCatch(
+    compute_prior_from_first_L(masked_train$Zt,
+                               masked_train$ct,
+                               masked_train$yt,
+                               L = L_use, inflate = 2.0),
+    error = function(e) NULL
+  )
+
+  if (is.null(pr) ||
+      any(!is.finite(pr$m0)) ||
+      any(!is.finite(pr$P0))) {
+    return(list(m0 = c(0,0), P0 = diag(1e6, 2)))
+  }
+  pr
+}
+
+# ============================= Core runner ==================================
+
+run_oos_section <- function(section_name,
+                            train_start, train_end,
+                            test_start,  test_end,
+                            n_starts = 10, seed = 42) {
+
+  tr <- clamp_window(train_start, train_end)
+  te <- clamp_window(test_start,  test_end)
+
+  if (is.null(tr) || is.null(te)) {
+    message(sprintf("[%s] Skipped (window outside data).", section_name))
+    return(invisible(NULL))
+  }
+
+  is_train <- dates_all >= tr[1] & dates_all <= tr[2]
+  is_test  <- dates_all >= te[1] & dates_all <= te[2]
+
+  if (!any(is_train) || !any(is_test)) {
+    message(sprintf("[%s] Skipped (empty slice).", section_name))
+    return(invisible(NULL))
+  }
+
+  Y_train   <- Y[,  is_train, drop = FALSE]
+  Tau_train <- Tau[, is_train, drop = FALSE]
+  Y_test    <- Y[,  is_test,  drop = FALSE]
+  Tau_test  <- Tau[, is_test,  drop = FALSE]
+
+  if (ncol(Y_train) < 20) {
+    message(sprintf("[%s] Skipped (training window too short).", section_name))
+    return(invisible(NULL))
+  }
+
+  # (1) Estimate theta on TRAIN (robust selection)
+  theta_train <- fit_theta_train(
+    Y_train, Tau_train,
+    n_starts = n_starts, seed = seed
+  )
+
+  # (2) TRAIN filter
+  ss_tr <- make_ss_arrays(theta_train, Tau_train, Delta_t)
+  masked_tr <- apply_missing_mask_fkf(Y_train, ss_tr)
+  pr <- get_prior_safe(masked_tr, L_use = 6)
+
+  kf_tr <- fkf(
+    a0  = pr$m0, P0 = pr$P0,
+    dt  = masked_tr$dt, ct = masked_tr$ct,
+    Tt  = masked_tr$Tt, Zt = masked_tr$Zt,
+    HHt = masked_tr$HHt, GGt = masked_tr$GGt,
+    yt  = masked_tr$yt
+  )
+
+  if (mean(is.finite(kf_tr$vt)) < 0.7) {
+    stop(sprintf("[%s] TRAIN innovations mostly non-finite.", section_name),
+         call. = FALSE)
+  }
+
+  # (3) TEST filter (1-step-ahead forecasts)
+  # FKF updates the first supplied observation before applying a transition, so
+  # a0/P0 must be the predicted a_{T+1|T}, P_{T+1|T} (as in the strategy code),
+  # not the filtered a_{T|T}, P_{T|T}.
+  aT <- kf_tr$at[, ncol(Y_train) + 1L]
+  PT <- kf_tr$Pt[,, ncol(Y_train) + 1L]
+
+  if (any(!is.finite(aT)) || any(!is.finite(PT))) {
+    stop(sprintf("[%s] Non-finite end-of-train state.", section_name),
+         call. = FALSE)
+  }
+
+  ss_te <- make_ss_arrays(theta_train, Tau_test, Delta_t)
+  masked_te <- apply_missing_mask_fkf(Y_test, ss_te)
+
+  kf_te <- fkf(
+    a0  = as.numeric(aT), P0 = PT,
+    dt  = masked_te$dt, ct = masked_te$ct,
+    Tt  = masked_te$Tt, Zt = masked_te$Zt,
+    HHt = masked_te$HHt, GGt = masked_te$GGt,
+    yt  = masked_te$yt
+  )
+
+  if (mean(is.finite(kf_te$vt)) < 0.7) {
+    stop(sprintf("[%s] TEST innovations mostly non-finite.", section_name),
+         call. = FALSE)
+  }
+
+  # (4) Metrics
+  rmse_oos <- sqrt(rowMeans(kf_te$vt^2, na.rm = TRUE))
+  mae_oos  <- rowMeans(abs(kf_te$vt), na.rm = TRUE)
+  rmse_in  <- sqrt(rowMeans(kf_tr$vt^2, na.rm = TRUE))
+
+  oos_tbl <- tibble(
+    maturity = mats_lab,
+    RMSE_OOS = rmse_oos,
+    MAE_OOS  = mae_oos
+  )
+
+  compare_tbl <- oos_tbl %>%
+    mutate(RMSE_in_sample_train = rmse_in,
+           OOS_minus_in_sample  = RMSE_OOS - RMSE_in_sample_train)
+
+  cat(sprintf("\n===== %s =====\n", section_name))
+  print(oos_tbl)
+  print(compare_tbl)
+
+    invisible(list(
+    # summary tables
+    oos_tbl     = oos_tbl,
+    compare_tbl = compare_tbl,
+
+    # --- ADD: everything needed for Step-6-style OOS visuals (no recompute) ---
+    meta = list(
+      section_name = section_name,
+      train_window = tr,
+      test_window  = te
+    ),
+    theta_train = theta_train,
+
+    # data slices
+    dates_test  = dates_all[is_test],
+    Y_test      = Y_test,
+    Tau_test    = Tau_test,
+
+    # state-space arrays for TEST (needed for Z_t, c_t in measurement equation)
+    ss_te       = ss_te,
+
+    # Kalman filter outputs
+    kf_tr       = kf_tr,
+    kf_te       = kf_te
+  ))
+
+}
+
+# ============================= Four sections ================================
+
+res_norm1 <- run_oos_section(
+  "Section 1 — Normal A (Train 1990–2004, Test 2005–2014)",
+  "1990-01-01","2004-12-31",
+  "2005-01-01","2014-12-31"
+)
+
+res_norm2 <- run_oos_section(
+  "Section 2 — Normal B (Train 2005–2014, Test 2015–2024)",
+  "2005-01-01","2014-12-31",
+  "2015-01-01","2024-12-31"
+)
+
+res_cris1 <- run_oos_section(
+  "Section 3 — Crisis 1 (Train 2003–2007, Test 2008)",
+  "2003-01-01","2007-12-31",
+  "2008-01-01","2008-12-31"
+)
+
+res_cris2 <- run_oos_section(
+  "Section 4 — Crisis 2 (Train 2017–2019, Test 2020)",
+  "2017-01-01","2019-12-31",
+  "2020-01-01","2020-12-31"
+)
+
+step8_multi_outputs <- list(
+  normal_1 = res_norm1,
+  normal_2 = res_norm2,
+  crisis_1 = res_cris1,
+  crisis_2 = res_cris2
+)
+
+
+###############################################################################
+# STEP 8 ADD-ON — OOS 1-step-ahead forecasts with 2/3 TRAIN – 1/3 TEST split
+###############################################################################
+
+# --- A) Define split (time-ordered) -----------------------------------------
+T_all   <- ncol(Y)
+T_train <- floor((2/3) * T_all)
+T_test  <- T_all - T_train
+stopifnot(T_train >= 20, T_test >= 10)
+
+idx_train <- 1:T_train
+idx_test  <- (T_train + 1):T_all
+
+cat(sprintf("Total T=%d | Train=%d | Test=%d\n", T_all, T_train, T_test))
+cat(sprintf("Train range: %s to %s\n", dates_all[1], dates_all[T_train]))
+cat(sprintf("Test  range: %s to %s\n", dates_all[T_train + 1], dates_all[T_all]))
+
+Y_train_23   <- Y[, idx_train, drop = FALSE]
+Tau_train_23 <- Tau[, idx_train, drop = FALSE]
+Y_test_13    <- Y[, idx_test,  drop = FALSE]
+Tau_test_13  <- Tau[, idx_test, drop = FALSE]
+
+# --- B) Estimate theta on 2/3 TRAIN (same robust estimation as Step 8) -------
+theta_23 <- fit_theta_train(
+  Y_train_23, Tau_train_23,
+  n_starts = 10, seed = 42
+)
+
+# --- C) Filter TRAIN to get end-of-train state ------------------------------
+ss_tr_23    <- make_ss_arrays(theta_23, Tau_train_23, Delta_t)
+masked_tr_23 <- apply_missing_mask_fkf(Y_train_23, ss_tr_23)
+pr_23       <- get_prior_safe(masked_tr_23, L_use = 6)
+
+kf_tr_23 <- FKF::fkf(
+  a0  = pr_23$m0, P0 = pr_23$P0,
+  dt  = masked_tr_23$dt, ct = masked_tr_23$ct,
+  Tt  = masked_tr_23$Tt, Zt = masked_tr_23$Zt,
+  HHt = masked_tr_23$HHt, GGt = masked_tr_23$GGt,
+  yt  = masked_tr_23$yt
+)
+
+if (mean(is.finite(kf_tr_23$vt)) < 0.7) {
+  stop("[2/3–1/3] TRAIN innovations mostly non-finite.", call. = FALSE)
+}
+
+T_train_eff <- ncol(masked_tr_23$yt)
+# Predicted a_{T+1|T}, P_{T+1|T} for the first test week (see Step 8 runner).
+aT1_T_23 <- kf_tr_23$at[,  T_train_eff + 1L]
+PT1_T_23 <- kf_tr_23$Pt[,, T_train_eff + 1L]
+
+if (any(!is.finite(aT1_T_23)) || any(!is.finite(PT1_T_23))) {
+  stop("[2/3–1/3] Non-finite end-of-train state.", call. = FALSE)
+}
+
+# --- D) Run TEST (1/3) recursion --------------------------------------------
+ss_te_13     <- make_ss_arrays(theta_23, Tau_test_13, Delta_t)
+masked_te_13 <- apply_missing_mask_fkf(Y_test_13, ss_te_13)
+
+kf_te_13 <- FKF::fkf(
+  a0  = as.numeric(aT1_T_23),
+  P0  = PT1_T_23,
+  dt  = masked_te_13$dt, ct = masked_te_13$ct,
+  Tt  = masked_te_13$Tt, Zt = masked_te_13$Zt,
+  HHt = masked_te_13$HHt, GGt = masked_te_13$GGt,
+  yt  = masked_te_13$yt
+)
+
+if (mean(is.finite(kf_te_13$vt)) < 0.7) {
+  stop("[2/3–1/3] TEST innovations mostly non-finite.", call. = FALSE)
+}
+
+# --- E) Forecast accuracy summary (same style as Step 8) ---------------------
+rmse_oos_13 <- sqrt(rowMeans(kf_te_13$vt^2, na.rm = TRUE))
+mae_oos_13  <- rowMeans(abs(kf_te_13$vt), na.rm = TRUE)
+rmse_in_23  <- sqrt(rowMeans(kf_tr_23$vt^2, na.rm = TRUE))
+
+oos_tbl_23_13 <- tibble(
+  maturity = mats_lab,
+  RMSE_OOS = rmse_oos_13,
+  MAE_OOS  = mae_oos_13
+)
+
+compare_tbl_23_13 <- oos_tbl_23_13 %>%
+  mutate(RMSE_in_sample_train = rmse_in_23,
+         OOS_minus_in_sample  = RMSE_OOS - RMSE_in_sample_train)
+
+cat("\n===== ADD-ON — 2/3 TRAIN → 1/3 TEST =====\n")
+print(oos_tbl_23_13)
+print(compare_tbl_23_13)
+
+# (Optional) store in the same list
+step8_multi_outputs$split_2over3_1over3 <- list(
+  oos_tbl = oos_tbl_23_13,
+  compare_tbl = compare_tbl_23_13
+)
+
+
+
+```
+
+### Visual Representation
+
+**Out-of-sample visual evaluation of the term structure.**\
+This extension to Step 8 provides a visual out-of-sample assessment of the Schwartz–Smith (2000) model by examining how well the estimated model predicts the cross-sectional shape of the futures curve in real time. For each evaluation window, model parameters are estimated using only the training subsample. These parameters are then held fixed while the model is applied to the subsequent test period. At each test date, the one-step-ahead predicted latent state, formed before observing contemporaneous futures prices, is used to construct the model-implied futures curve across maturities. This predicted curve is directly compared to the realized futures prices observed in the market, allowing for a clear visual assessment of the model’s real-time pricing performance.
+
+**Forecast versus update: interpreting the two model-implied curves.**\
+For each test date, the visualization overlays two model-implied curves: a dashed curve representing the one-step-ahead out-of-sample forecast and a solid curve representing the filtered estimate after observing the contemporaneous futures prices. The forecast curve is based on the predicted state at∣t−1​ and reflects the model’s genuine out-of-sample implication of the futures term structure using training-only parameter estimates. The filtered curve, by contrast, incorporates the current observation and shows how the model updates its latent state once new information arrives. The distance between the two curves therefore captures the real-time forecast error and the magnitude of the state revision induced by incoming market data, providing insight into both predictive accuracy and model adaptability.
+
+**Relation to Schwartz and Smith (2000).**\
+This exercise closely aligns with the state-space interpretation underlying Schwartz and Smith (2000), in which futures prices are viewed as noisy observations of latent economic factors driving the term structure. While the original paper focuses primarily on estimation and valuation implications, the present analysis extends the framework by explicitly examining the model’s real-time out-of-sample performance at the level of the entire futures curve. By showing that parameters estimated on historical data can generate economically sensible one-step-ahead forecasts across maturities, and by illustrating how these forecasts are subsequently updated by new observations, this extension provides a natural and conceptually consistent complement to the original methodology, reinforcing the empirical relevance and structural coherence of the Schwartz–Smith model.
+
+```{r step8_visuals}
+
+###############################################################################
+# STEP 8 (ADD-ON) — Visual OOS term structures from stored Step 8 outputs
+#   Forecast:  a_{t|t-1}  (kf_te$at)   -> true one-step-ahead OOS
+#   Filtered:  a_{t|t}    (kf_te$att)  -> after seeing y_t
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(tibble)
+  library(dplyr)
+  library(cowplot)
+})
+
+# --- choose evenly spaced indices in the TEST sample ---
+.pick_spaced_idx <- function(nT, n = 6) {
+  if (nT <= n) return(seq_len(nT))
+  unique(round(seq(1, nT, length.out = n)))
+}
+
+# --- build smooth curve for a given state (chi, xi) and theta ---
+.curve_from_state <- function(theta, chi, xi, tau_grid) {
+  A_grid <- A_fun(
+    T          = tau_grid,
+    kappa      = theta$kappa,
+    mu_star    = theta$mu_star,
+    sigma_chi  = theta$sigma_chi,
+    sigma_xi   = theta$sigma_xi,
+    rho        = theta$rho,
+    lambda_chi = theta$lambda_chi
+  )
+  A_grid + exp(-theta$kappa * tau_grid) * chi + xi
+}
+
+# --- one panel: observed vs forecast vs filtered at a specific TEST index j ---
+.oos_panel_one <- function(res, j, in_levels = FALSE) {
+  stopifnot(is.list(res), !is.null(res$kf_te), !is.null(res$ss_te))
+
+  theta <- res$theta_train
+  kf    <- res$kf_te
+  ss    <- res$ss_te
+
+  # observation + maturities for this test week
+  y_obs_log <- as.numeric(res$Y_test[, j])
+  tau_pts   <- as.numeric(res$Tau_test[, j])
+  Z_t       <- ss$Zt[, , j]
+  c_t       <- ss$ct[, j]
+
+  # states:
+  a_pred <- as.numeric(kf$at[,  j])   # a_{t|t-1}  (true OOS forecast state)
+  a_filt <- as.numeric(kf$att[, j])   # a_{t|t}    (after seeing y_t)
+
+  # predicted & filtered fitted values at traded maturities
+  y_pred_log <- as.numeric(c_t + Z_t %*% a_pred)
+  y_filt_log <- as.numeric(c_t + Z_t %*% a_filt)
+
+  # smooth maturity grid
+  tau_grid <- seq(0, max(tau_pts, na.rm = TRUE), length.out = 200)
+
+  y_pred_grid_log <- .curve_from_state(theta, a_pred[1], a_pred[2], tau_grid)
+  y_filt_grid_log <- .curve_from_state(theta, a_filt[1], a_filt[2], tau_grid)
+
+  # levels vs logs
+  if (isTRUE(in_levels)) {
+    y_obs  <- exp(y_obs_log)
+    y_pred <- exp(y_pred_log)
+    y_filt <- exp(y_filt_log)
+    y_pred_grid <- exp(y_pred_grid_log)
+    y_filt_grid <- exp(y_filt_grid_log)
+    ylab <- "Price (levels)"
+  } else {
+    y_obs  <- y_obs_log
+    y_pred <- y_pred_log
+    y_filt <- y_filt_log
+    y_pred_grid <- y_pred_grid_log
+    y_filt_grid <- y_filt_grid_log
+    ylab <- "log price"
+  }
+
+  df_obs <- tibble(maturity_m = 12 * tau_pts, value = y_obs)
+  df_pts <- tibble(
+    maturity_m = 12 * tau_pts,
+    Forecast   = y_pred,
+    Filtered   = y_filt
+  ) |> tidyr::pivot_longer(-maturity_m, names_to = "series", values_to = "value")
+
+  df_line <- tibble(
+    maturity_m = 12 * tau_grid,
+    Forecast   = y_pred_grid,
+    Filtered   = y_filt_grid
+  ) |> tidyr::pivot_longer(-maturity_m, names_to = "series", values_to = "value")
+
+  date_lab <- if (!is.null(res$dates_test)) format(res$dates_test[j], "%d %b %Y") else paste("Test", j)
+
+  ggplot() +
+    # smooth curves (Forecast vs Filtered)
+    geom_line(data = df_line, aes(maturity_m, value, linetype = series),
+          colour = "black", linewidth = 0.9, show.legend = FALSE) +
+    # observed points (add to legend via shape mapping)
+    geom_point(data = df_obs, aes(maturity_m, value, shape = "Observed (log futures)"),
+              fill = "white", colour = "black",
+              size = 2.6, stroke = 0.9) +
+    # dots at traded maturities for forecast & filtered
+    geom_point(data = df_pts, aes(maturity_m, value, shape = series),
+               colour = "black", size = 1.9) +
+    scale_linetype_manual(values = c(Forecast = "dashed", Filtered = "solid")) +
+    scale_shape_manual(values = c(
+                      "Filtered" = 19,
+                      "Forecast" = 1,
+                      "Observed (log futures)" = 21
+                    )) +
+    labs(
+      title = date_lab,
+      x = "Maturity (months)", y = ylab,
+      shape = NULL
+    ) +
+    theme_classic(base_size = 10) 
+}
+
+# --- grid wrapper like Step 6 ---
+plot_oos_grid_from_step8 <- function(res, n_panels = 6, in_levels = FALSE, savepath = NULL) {
+  nT <- ncol(res$Y_test)
+  idx <- .pick_spaced_idx(nT, n = n_panels)
+
+  # Build plots
+  plots <- lapply(idx, function(j) .oos_panel_one(res, j, in_levels = in_levels))
+
+  # Extract ONE legend from the first plot
+  leg <- cowplot::get_legend(
+    plots[[1]] + theme(legend.position = "top")
+  )
+
+  # Remove legends from all panels
+  plots <- lapply(plots, function(p) p + theme(legend.position = "none"))
+
+  # Arrange grid
+  grid <- cowplot::plot_grid(plotlist = plots, ncol = 3)
+
+  ttl  <- if (!is.null(res$meta$section_name)) res$meta$section_name else "OOS Visual"
+  top  <- cowplot::ggdraw() + cowplot::draw_label(ttl, fontface = "bold", x = 0, hjust = 0)
+
+  # Combine: title + legend + grid
+  fig <- cowplot::plot_grid(
+    top,
+    leg,
+    grid,
+    ncol = 1,
+    rel_heights = c(0.08, 0.10, 0.82)
+  )
+
+  print(fig)
+
+  if (!is.null(savepath)) {
+    dir.create(dirname(savepath), recursive = TRUE, showWarnings = FALSE)
+    ggsave(savepath, fig, width = 14, height = max(6, ceiling(length(plots)/3)*2.2), dpi = 300)
+  }
+
+  invisible(fig)
+}
+
+
+# ---- Example calls (uncomment) ----
+plot_oos_grid_from_step8(res_norm1)
+plot_oos_grid_from_step8(res_norm2)
+plot_oos_grid_from_step8(res_cris1)
+plot_oos_grid_from_step8(res_cris2)
+
+
+```
+
+## Step 9: Comparison with SS2000 Tables 2 & 3
+
+This final step compares the full-timeline replication results directly to the benchmark findings reported in Schwartz and Smith (2000). The goal is to assess whether an independently implemented version of the same model reproduces the key empirical magnitudes documented in the original study.
+
+First, the estimated structural parameters are aligned with the layout of Table 2 in SS2000. Overall, the core parameters governing mean reversion, factor volatilities, and measurement error are of similar order of magnitude to those reported in the paper, indicating that the model captures comparable dynamics in futures prices. At the same time, some differences emerge, particularly for the long-term mean level and the maturity-specific measurement errors, which is expected given the longer sample period and updated data used in this replication.
+
+Second, the fit of the model is evaluated using innovation-based error measures analogous to those reported in Table 3 of SS2000. The results show that pricing errors generally decrease with maturity and remain small in absolute terms, consistent with the patterns documented in the original paper. While the longer sample and different market environments naturally lead to deviations from the exact SS2000 values, the overall structure of pricing accuracy across maturities is preserved.
+
+Taken together, these comparisons suggest that the full-timeline replication successfully reproduces the main empirical features of Schwartz and Smith (2000), while also reflecting differences attributable to sample extension and evolving market conditions rather than methodological inconsistencies.
+
+```{r step9}
+#############################################################################
+# STEP 9 — Compare the estimates with SS2000 Tables 2 & 3
+#############################################################################
+
+stopifnot(all(c("kappa","mu","mu_star","sigma_chi","sigma_xi","rho","lambda_chi","sigma_obs_vec") %in% names(theta_hat)))
+lambda_xi_implied <- theta_hat$mu - theta_hat$mu_star
+
+# --- 1) Estimated parameters ----------------------------------------------------
+my_params <- tibble::tibble(
+  parameter = c(
+    "kappa","mu","mu_star","sigma_chi","sigma_xi","rho","lambda_chi","lambda_xi",
+    paste0("sigma_obs_", c("1m","5m","9m","13m","17m"))
+  ),
+  estimate = c(
+    theta_hat$kappa, theta_hat$mu, theta_hat$mu_star,
+    theta_hat$sigma_chi, theta_hat$sigma_xi, theta_hat$rho,
+    theta_hat$lambda_chi, lambda_xi_implied,
+    as.numeric(theta_hat$sigma_obs_vec)
+  )
+)
+
+# Attach SEs if available.
+# Note: the SE table uses sigma_obs_1..sigma_obs_5, while we label them by maturity
+# (1m, 5m, 9m, 13m, 17m) to match the Table 2 layout we print.
+if (exists("parameter_se") && is.data.frame(parameter_se)) {
+
+  parameter_se_step9 <- parameter_se |>
+    dplyr::mutate(
+      parameter = dplyr::case_when(
+        parameter == "sigma_obs_1" ~ "sigma_obs_1m",
+        parameter == "sigma_obs_2" ~ "sigma_obs_5m",
+        parameter == "sigma_obs_3" ~ "sigma_obs_9m",
+        parameter == "sigma_obs_4" ~ "sigma_obs_13m",
+        parameter == "sigma_obs_5" ~ "sigma_obs_17m",
+        TRUE ~ parameter
+      )
+    )
+
+  my_params <- dplyr::left_join(
+    my_params,
+    dplyr::select(parameter_se_step9, parameter, se),
+    by = "parameter"
+  )
+
+} else {
+  my_params$se <- NA_real_
+}
+
+
+# --- 2) Paper values (SS2000 Table 2) -------------------------------------------
+paper_params <- tibble::tibble(
+  parameter = c(
+    "kappa","mu", "mu_star","sigma_chi","sigma_xi","rho","lambda_chi",
+    paste0("sigma_obs_", c("1m","5m","9m","13m","17m"))
+  ),
+  paper_val = c(
+    1.49,
+    -0.0125,
+    0.0115,
+    0.286,
+    0.145,
+    0.300,
+    0.157,
+    0.042, 0.006, 0.003, 0.000, 0.004
+  )
+)
+
+compare_params <- dplyr::left_join(my_params, paper_params, by = "parameter") |>
+  dplyr::mutate(
+    abs_diff   = estimate - paper_val,
+    rel_diff   = dplyr::if_else(!is.na(paper_val) & paper_val != 0, abs_diff / paper_val, NA_real_),
+    within_2se = dplyr::if_else(!is.na(se), abs(abs_diff) <= 2 * se, NA)
+  )
+
+# --- 3) OOS comparison (based on Step 8 outputs) ----------------------------
+# Step 8 returns per-section results in objects such as res_norm1, res_norm2, ...
+# We compare the TRAIN in-sample RMSE (innovations) with the paper's Table 3 SDs
+# as a rough calibration, and report the OOS RMSE as additional information.
+
+stopifnot(exists("res_norm1") || exists("step8_multi_outputs"))
+
+# Reference OOS section for the comparison (first normal window)
+res_ref <- if (exists("res_norm1") && !is.null(res_norm1)) res_norm1 else step8_multi_outputs$normal_1
+stopifnot(!is.null(res_ref), !is.null(res_ref$compare_tbl))
+
+fit_my <- res_ref$compare_tbl %>%
+  dplyr::transmute(
+    maturity = maturity,
+    rmse_in_sample_train = RMSE_in_sample_train,
+    rmse_oos             = RMSE_OOS,
+    oos_minus_in         = OOS_minus_in_sample
+  ) %>%
+  dplyr::mutate(
+  maturity = dplyr::case_when(
+    # already in paper units
+    maturity %in% c("1m","5m","9m","13m","17m") ~ maturity,
+
+    # generic index labels from Step 8 when ranks are absent
+    maturity %in% c("1","1m") ~ "1m",
+    maturity %in% c("2","2m") ~ "5m",
+    maturity %in% c("3","3m") ~ "9m",
+    maturity %in% c("4","4m") ~ "13m",
+    maturity %in% c("5","5m") ~ "17m",
+
+    # just in case maturity labels came through like "CL1", "CL5", etc.
+    grepl("^CL\\d+$", maturity) ~ paste0(sub("^CL", "", maturity), "m"),
+
+    TRUE ~ maturity
+  )
+)
+
+
+paper_fit <- tibble::tibble(
+  maturity  = c("1m","5m","9m","13m","17m"),
+  sd_paper  = c(0.0414, 0.0044, 0.0025, 0.0000, 0.0035),
+  mae_paper = c(0.0314, 0.0035, 0.0020, 0.0000, 0.0028)
+)
+
+compare_fit <- dplyr::left_join(fit_my, paper_fit, by = "maturity") %>%
+  dplyr::mutate(
+    sd_abs_diff = rmse_in_sample_train - sd_paper,
+    sd_rel_diff = dplyr::if_else(sd_paper != 0, sd_abs_diff / sd_paper, NA_real_)
+  )
+
+
+# --- 4) Table 3 replication using full-sample innovations vt from kf_hat ----
+stopifnot(exists("kf_hat"), is.list(kf_hat), !is.null(kf_hat$vt))
+
+vt <- kf_hat$vt
+stopifnot(all(dim(vt) == dim(Y)))
+
+# Restore missingness so stats ignore weeks where contract is missing
+vt[is.na(Y)] <- NA_real_
+
+
+# Compute Table-3 style moments per contract
+tab3_my_by_contract <- tibble::tibble(
+  contract = rownames(Y),
+  mean_error = rowMeans(vt, na.rm = TRUE),
+  sd_error   = apply(vt, 1, sd, na.rm = TRUE),
+  mae_error  = rowMeans(abs(vt), na.rm = TRUE)
+)
+
+# Map contracts to paper maturities (CL1, CL5, CL9, CL13, CL17 -> 1m,5m,9m,13m,17m)
+tab3_my <- tab3_my_by_contract |>
+  dplyr::mutate(
+    cl_num = suppressWarnings(as.integer(stringr::str_extract(contract, "(?<=CL)\\d+"))),
+    maturity = dplyr::case_when(
+      cl_num == 1  ~ "1m",
+      cl_num == 5  ~ "5m",
+      cl_num == 9  ~ "9m",
+      cl_num == 13 ~ "13m",
+      cl_num == 17 ~ "17m",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  dplyr::filter(!is.na(maturity)) |>
+  dplyr::select(maturity, mean_error, sd_error, mae_error)
+
+# Paper Table 3 values (Futures Data)
+tab3_paper <- tibble::tibble(
+  maturity    = c("1m","5m","9m","13m","17m"),
+  mean_paper  = c(-0.0053, 0.0005, -0.0002, 0.0000, 0.0000),
+  sd_paper    = c( 0.0414, 0.0044,  0.0025, 0.0000, 0.0035),
+  mae_paper   = c( 0.0314, 0.0035,  0.0020, 0.0000, 0.0028)
+)
+
+# Compare the Table 3 statistics with the paper's
+tab3_compare <- dplyr::left_join(tab3_my, tab3_paper, by = "maturity") |>
+  dplyr::mutate(
+    mean_diff = mean_error - mean_paper,
+    sd_diff   = sd_error   - sd_paper,
+    mae_diff  = mae_error  - mae_paper
+  )
+
+
+print(compare_params)
+print(compare_fit)
+print(tab3_compare)
+
+step9_outputs <- list(
+  parameters_comparison = compare_params,
+  oos_fit_comparison    = compare_fit,
+  table3_comparison     = tab3_compare
+)
+
+```

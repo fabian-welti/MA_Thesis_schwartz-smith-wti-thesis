@@ -1,0 +1,1106 @@
+---
+title: "S&S 2000 Full Timeline"
+author: "Fabian Welti"
+date: "2026-02-19"
+output: html_document
+---
+## Step 0: Computational Setup and Helper Functions
+
+This section prepares the computational environment for the empirical analysis. It loads the required R packages, defines small helper functions used throughout the script, and sets up calendar utilities for consistent business-day and maturity alignment. In addition, a custom print method is introduced to improve the readability of estimated parameters by hiding internal optimization variables that have no direct economic interpretation. These steps do not affect the model specification or estimation results and are included solely for reproducibility and clarity.
+
+```{r setup}
+
+#############################################################################
+# STEP 0 — Setup: packages, print helper, and calendar utilities
+#############################################################################
+
+# Reproducibility 
+set.seed(42)
+
+# Packages 
+library(tidyverse) # Core data manipulation and plotting
+library(tsibble) # Time series / indexed tibbles
+library(lubridate) # Dates, times, business-day arithmetic helpers we define below
+library(FKF) # Kalman filter / state-space model routines used for likelihood evaluation
+library(rprojroot)
+
+#############################################################################
+# STEP 0.1 — Custom print method
+# Purpose: Output formatting helper; hide `sigma_obs_raw` when printing `theta_hat` objects, but keep the
+# value stored inside the object for downstream computations and diagnostics.
+#############################################################################
+
+print.theta_hat <- function(x, ...) {
+  y <- x
+  # Remove sigma_obs_raw from the *printed view* only (do not delete from x)
+  if ("sigma_obs_raw" %in% names(y)) y$sigma_obs_raw <- NULL
+
+  # Print as a plain list (drop the "theta_hat" class temporarily)
+  old_class <- class(y)
+  class(y) <- setdiff(old_class, "theta_hat")
+  print(y, ...)
+  invisible(x)
+}
+
+```
+
+## Step 1: Data Preparation and Contract Maturity Construction
+
+This section prepares the input data required for the empirical analysis. Weekly WTI crude oil futures prices are imported directly from Bloomberg and cover the full available sample from 28 December 1984 to 26 December 2025. The dataset contains Bloomberg generic futures (CL1, CL5, CL9, CL13, and CL17), together with the underlying exchange-traded contract associated with each generic and the corresponding last trading date (LTD) of that underlying contract. Settlement prices are transformed into log prices and arranged into an observation matrix that serves as the input for the state-space model.
+
+Time to maturity is computed directly from the actual last trading date of the underlying contract referenced by each generic future at each observation date. For every week t, the remaining time to maturity is calculated as the difference between the underlying contract’s LTD and the observation date, expressed in years. Negative maturities (which would imply an already expired contract) are excluded. For the front contract (CL1), observations that coincide with the last trading date are treated as missing in the measurement equation to avoid boundary effects at expiry while preserving the remaining cross-sectional information for that week.
+
+The resulting maturity matrix is fully aligned with the log price matrix so that each observation corresponds precisely to the maturity of the contract that is actually referenced on that date. This ensures consistency between the observed futures prices and their associated time-to-maturity structure within the state-space framework.
+
+```{r step1}
+#############################################################################
+# STEP 1 — Data: weekly observations; full timeline
+#############################################################################
+DATA_ROOT <- "/Users/lucaswelti/Library/Mobile Documents/com~apple~CloudDocs/HSG/MBF /Master Thesis /MA Code /Master Thesis 1.1"
+
+# Contracts (tickers) used in the weekly futures dataset
+contracts <- c("CL1 Comdty", "CL5 Comdty", "CL9 Comdty", "CL13 Comdty", "CL17 Comdty")
+
+#############################################################################
+# STEP 1.0 — Load the Bloomberg dataset (built by Full Bloomberg Data Import Weekly.R)
+# We use the "full" dataset that contains:
+# - {contract}__PX   : settlement price of generic series
+# - {contract}__UND  : underlying actual contract ticker used by Bloomberg
+# - {contract}__LTD  : last trade date of that underlying contract
+#############################################################################
+
+weekly_full <- readr::read_rds(file.path(DATA_ROOT, "data", "CL_weekly_full_with_underlying_v2.rds")) %>%
+  dplyr::mutate(date = as.Date(date))
+
+# Safety: check that for each contract we have PX and LTD columns
+needed_px  <- paste0(contracts, "__PX")
+needed_ltd <- paste0(contracts, "__LTD")
+
+stopifnot(all(needed_px  %in% names(weekly_full)))
+stopifnot(all(needed_ltd %in% names(weekly_full)))
+
+# Full timeline: use all available weekly observations
+weekly_win <- weekly_full %>%
+  dplyr::arrange(date)
+
+#############################################################################
+# STEP 1.1 — Build log-price observation matrix Y 
+#############################################################################
+
+weekly_log <- weekly_win %>%
+  dplyr::transmute(
+    obs_date = date,
+    dplyr::across(
+      dplyr::all_of(needed_px),
+      ~ ifelse(is.na(.x), NA_real_, log(as.numeric(.x))),
+      .names = "log_{.col}"
+    )
+  )
+
+# Build observation matrix Y (contracts x time)
+Y <- weekly_log %>%
+  dplyr::select(dplyr::starts_with("log_")) %>%
+  as.matrix() %>%
+  t()
+
+storage.mode(Y) <- "double"
+
+obs_dates <- weekly_log$obs_date
+colnames(Y) <- as.character(obs_dates)
+
+#############################################################################
+# STEP 1.2 — Build time-to-maturity matrix Tau using Bloomberg LTD
+# Tau_{i,t} = (LTD_{i,t} - t) / 365.25
+#############################################################################
+
+# Extract the LTD columns in the same order as contracts
+LTD_df <- weekly_win %>%
+  dplyr::select(date, dplyr::all_of(needed_ltd))
+
+# Convert to matrix: rows correspond to dates, columns to contracts' LTDs
+LTD_mat <- LTD_df %>%
+  dplyr::select(-date) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.Date)) %>%
+  as.matrix()
+
+# Compute Tau as m x T (same orientation as Y): contracts (rows) x time (cols)
+Tau <- matrix(NA_real_, nrow = length(contracts), ncol = length(obs_dates))
+rownames(Tau) <- contracts
+colnames(Tau) <- as.character(obs_dates)
+
+for (j in seq_along(obs_dates)) {
+  tdate <- obs_dates[j]
+
+  # LTDs at time j for all contracts (vector length m)
+  ltd_vec <- as.Date(LTD_mat[j, ])
+
+  tau_vec <- as.numeric(ltd_vec - tdate) / 365.25
+
+  # invalid maturity: missing or non-positive time to maturity
+  tau_vec[is.na(ltd_vec) | tau_vec <= 0] <- NA_real_
+
+  Tau[, j] <- tau_vec
+}
+
+#############################################################################
+# STEP 1.3 — CL1 edge-case fix + ensure Tau never contains NA for make_ss_arrays()
+#############################################################################
+
+# find CL1 row in Y by name
+cl1_row_Y <- which(rownames(Y) == "log_CL1 Comdty__PX")
+stopifnot(length(cl1_row_Y) == 1)
+
+# Tau rows are in the same order as contracts (CL1, CL5, CL9, CL13, CL17)
+cl1_row_Tau <- 1
+
+bad_cl1 <- which(is.na(Tau[cl1_row_Tau, ]) | Tau[cl1_row_Tau, ] <= 0)
+
+# Drop CL1 observation on those weeks
+Y[cl1_row_Y, bad_cl1] <- NA_real_
+
+# Keep Tau finite so make_ss_arrays() does not produce NA in ct / Zt
+Tau[cl1_row_Tau, bad_cl1] <- 0
+
+# Ensure Y and Tau have consistent missingness:
+# If Tau is NA, the corresponding observed log price must be treated as missing
+Y[is.na(Tau)] <- NA_real_
+
+# CRITICAL (for optimization): remove remaining NA Tau so ss arrays stay finite
+Tau[is.na(Tau)] <- 0
+
+#############################################################################
+# STEP 1.4 — Simple sanity checks
+#############################################################################
+
+tau_check <- apply(Tau, 2, function(x) {
+  xx <- x[is.finite(x) & x > 0]
+  if (length(xx) <= 1) return(NA)
+  all(diff(xx) > 0)
+})
+message("Share of dates with strictly increasing Tau across contracts: ",
+        round(mean(tau_check, na.rm = TRUE), 3))
+
+
+message("Tau NA count after cleanup: ", sum(is.na(Tau)))
+message("Any non-finite Tau? ", any(!is.finite(Tau)))
+
+
+
+# -------------------------------------------------------------------------
+# CHECK: Are observation dates strictly 7 days apart?
+# -------------------------------------------------------------------------
+
+dt_days <- as.numeric(diff(obs_dates))
+
+if (all(dt_days == 7)) {
+  cat("✓ All observation gaps are exactly 7 days.\n")
+} else {
+  cat("✗ Non-weekly gaps detected.\n")
+  cat("Unique gaps found (in days): ",
+      paste(sort(unique(dt_days)), collapse = ", "), "\n")
+}
+
+```
+
+## Step 2: State-Space Model Construction and Helper Functions
+
+This section implements the two-factor model of Schwartz and Smith (2000) in a state-space form suitable for estimation via the Kalman filter. Building on the observation matrix of log futures prices and the corresponding maturity matrix constructed in Step 1, the measurement and transition equations implied by the model are translated into time-indexed arrays that conform to the requirements of the Kalman filtering algorithm.
+
+The measurement equation expresses each observed log futures price as a linear function of two latent state variables: a mean-reverting short-term factor and a non-stationary long-term factor. The factor loadings depend explicitly on time to maturity, reflecting the exponential decay of the short-term factor’s influence with maturity, while the long-term factor enters with unit loading across all contracts. In addition, the maturity-dependent intercept term from the futures pricing equation is computed analytically and incorporated directly into the measurement equation, consistent with the closed-form pricing relation derived in Schwartz and Smith (2000).
+
+The transition equation governs the joint dynamics of the latent factors under a weekly sampling frequency. The short-term factor follows an Ornstein–Uhlenbeck process, while the long-term factor evolves as a random walk with drift. The corresponding state transition matrix and innovation covariance matrix are obtained from the continuous-time specification by exact discretization over one-week intervals, preserving the theoretical structure of the model.
+
+Finally, a systematic procedure is introduced to handle missing futures price observations. Because the Kalman filter requires a complete observation vector at each time point, missing prices are accommodated by temporarily neutralizing their influence in the measurement equation and inflating their associated measurement error variances. This ensures that missing contracts do not distort the likelihood evaluation or state estimates, while allowing the full panel structure of the futures curve to be retained throughout the estimation.
+
+```{r step2}
+#############################################################################
+# STEP 2 — Model helpers and SS arrays
+#############################################################################
+
+# Weekly sampling interval in year units (used in state transition)
+Delta_t <- 7 / 365.25 # can be used since all observation gaps are exactly 7 days
+
+# Helper for A(T): the maturity-dependent "constant term" in log futures prices
+# This corresponds to the A(T) term in the paper’s futures pricing equation,
+# combining risk-neutral drift, short-term risk premium effect, and variance term.
+A_fun <- function(T, kappa, mu_star, sigma_chi, sigma_xi, rho, lambda_chi) {
+  # Variance of ln(S_T) implied by the two-factor model over horizon T
+  var_lnS <- (sigma_chi^2 / (2 * kappa)) * (1 - exp(-2 * kappa * T)) +
+    sigma_xi^2 * T + 2 * rho * sigma_chi * sigma_xi * (1 - exp(-kappa * T)) / kappa
+  
+  # A(T) = mu_star*T  - (1 - e^{-kappa T}) * (lambda_chi/kappa) + 0.5 * Var(ln S_T)
+  mu_star * T - (1 - exp(-kappa * T)) * (lambda_chi / kappa) + 0.5 * var_lnS
+}
+
+# Process noise covariance W(Δt) for the state transition:
+# x_t = c + G x_{t-1} + w_t ,   w_t ~ N(0, W)
+# where states are (chi, xi). This is the discretized covariance over one step Δt.
+process_W <- function(Delta_t, kappa, sigma_chi, sigma_xi, rho) {
+  # Var(chi) over Δt under OU dynamics
+  var_chi    <- (sigma_chi^2 / (2 * kappa)) * (1 - exp(-2 * kappa * Delta_t))
+  
+  # Var(xi) over Δt under Brownian motion
+  var_xi     <- sigma_xi^2 * Delta_t
+  
+  # Cov(chi, xi) induced by correlated Brownian shocks
+  cov_chi_xi <- rho * sigma_chi * sigma_xi * (1 - exp(-kappa * Delta_t)) / kappa
+  
+  matrix(c(var_chi, cov_chi_xi,
+           cov_chi_xi, var_xi), nrow = 2, byrow = TRUE)
+}
+
+# Build all state-space arrays needed for FKF, given parameters theta and maturities Tau.
+# Output list contains measurement equation objects (Zt, ct, GGt) and transition objects (Tt, dt, HHt).
+make_ss_arrays <- function(theta, Tau, Delta_t) {
+  # Dimensions implied by the data:
+  # - T_len: number of observation dates
+  # - m: number of contracts observed per date
+  # - n: number of latent states (chi, xi)
+  T_len <- ncol(Tau)   # number of time points
+  m     <- nrow(Tau)   # number of futures contracts
+  n     <- 2           # states: (chi, xi)
+  
+  # Unpack parameter vector/list into named objects (kappa, mu, sigmas, etc.)
+  with(as.list(theta), {
+    
+    # Measurement equation (time-varying through Tau):
+    # y_t = d_t + F_t x_t + v_t
+    # where y_t is the vector of log futures prices and x_t = (chi_t, xi_t).
+    Ft <- array(0, dim = c(m, n, T_len))          # F_t in the paper (called Zt in FKF)
+    d  <- matrix(0, nrow = m, ncol = T_len)       # d_t in the paper (called ct in FKF)
+    
+    for (tt in 1:T_len) {
+      tau_t <- Tau[, tt]                          # time-to-maturity for all contracts at date t
+      
+      # Each row corresponds to a contract i:
+      # ln F_{i,t} = exp(-kappa * tau_{i,t}) * chi_t + 1 * xi_t + A(tau_{i,t}) + error
+      Ft[, , tt] <- cbind(exp(-kappa * tau_t), rep(1, m))
+      
+      # Maturity-specific constant term A(tau) for each contract i
+      d[, tt]    <- A_fun(tau_t, kappa, mu_star, sigma_chi, sigma_xi, rho, lambda_chi)
+    }
+    
+    # Measurement error covariance V (assumed time-invariant here):
+    # V is diagonal with contract-specific observation SDs sigma_obs_vec.
+    # NOTE: V stores variances, hence sigma_obs_vec^2.
+    V <- diag(sigma_obs_vec^2, m)
+    
+    # State transition equation (weekly step size Δt):
+    # x_t = c_t + G_t x_{t-1} + w_t ,  w_t ~ N(0, W_t)
+    # Here G_t and c_t are constant across t because Δt is constant (weekly data).
+    Tt  <- array(0, dim = c(n, n, T_len))         # G_t in paper (called Tt in FKF)
+    dt  <- matrix(0, nrow = n, ncol = T_len)      # c_t in paper (called dt in FKF)
+    HHt <- array(0, dim = c(n, n, T_len))         # W_t in paper (called HHt in FKF)
+    
+    for (tt in 1:T_len) {
+      
+      # State transition matrix G(Δt):
+      # chi mean-reverts with exp(-kappa*Δt), xi follows a random walk (coefficient 1)
+      G_t <- matrix(c(exp(-kappa * Delta_t), 0,
+                      0,                  1),
+                    nrow = n, byrow = TRUE)
+      
+      # Drift term c(Δt): no drift for chi; xi has drift mu * Δt
+      c_t <- c(0, mu * Delta_t)
+      
+      # Process noise covariance W(Δt)
+      W_t <- process_W(Delta_t, kappa, sigma_chi, sigma_xi, rho)
+      
+      # Store time-t arrays
+      Tt[, , tt]  <- G_t
+      dt[, tt]    <- c_t
+      HHt[, , tt] <- W_t
+    }
+    
+    # Map our notation into FKF naming convention:
+    # - Zt, ct, GGt: measurement equation components
+    # - Tt, dt, HHt: transition equation components
+    list(
+      Tt  = Tt,
+      dt  = dt,
+      Zt  = Ft,
+      ct  = d,
+      HHt = HHt,
+      GGt = array(V, dim = c(m, m, T_len))        # replicate V for each time t
+    )
+  })
+}
+
+# Handle missing observations (NAs) in Y for FKF:
+# FKF expects a complete observation vector each period. To "ignore" missing entries:
+#  - set missing y_{i,t} to 0 (placeholder),
+#  - zero-out the corresponding rows of Zt and ct so that observation has no effect,
+#  - inflate the measurement variance for those entries so they receive ~0 weight.
+apply_missing_mask_fkf <- function(Y, ss, big_var = NULL, big_var_mult = 1e6) {
+  # ss must be the FKF-style list: Zt, ct, GGt, Tt, dt, HHt
+  m     <- dim(ss$Zt)[1]   # number of observed contracts
+  T_len <- ncol(Y)         # number of time points
+  
+  # Replace NAs with a neutral placeholder; rows are later effectively ignored via variance inflation
+  y_tilde <- Y
+  y_tilde[is.na(y_tilde)] <- 0
+  
+  # Copy arrays so we can modify them without changing the original ss object
+  Zt_new  <- ss$Zt
+  ct_new  <- ss$ct
+  GGt_new <- ss$GGt
+  
+  I <- diag(1, m)          # identity used in variance inflation construction
+  
+  # If big_var not provided, choose a scale-aware large variance based on typical V diagonal
+  if (is.null(big_var)) {
+    Vdiag <- diag(ss$GGt[,,1])                          # baseline measurement variances
+    Vmed  <- median(Vdiag[is.finite(Vdiag) & Vdiag > 0])
+    if (!is.finite(Vmed)) Vmed <- 1.0
+    big_var <- big_var_mult * Vmed
+  }
+  
+  # Apply masking time-by-time
+  for (tt in seq_len(T_len)) {
+    miss <- is.na(Y[, tt])                               # which contracts are missing at time t?
+    
+    # M is a diagonal "keep/drop" matrix:
+    # 1 keeps an observation, 0 drops it (for that contract at that time)
+    M <- diag(as.numeric(!miss), m, m)
+    
+    # Zero out the contribution of missing observations in the measurement equation
+    Zt_new[,,tt] <- M %*% Zt_new[,,tt]
+    ct_new[, tt] <- M %*% ct_new[, tt]
+    
+    # Inflate variances for missing observations so they are down-weighted to ~0
+    V_base <- GGt_new[,,tt]
+    GGt_new[,,tt] <- M %*% V_base %*% M + (I - M) * big_var
+  }
+  
+  # Return FKF-ready objects (same naming as FKF expects)
+  list(
+    yt  = y_tilde,
+    Zt  = Zt_new,
+    ct  = ct_new,
+    GGt = GGt_new,
+    Tt  = ss$Tt,
+    dt  = ss$dt,
+    HHt = ss$HHt
+  )
+}
+
+```
+
+## Step 3: Parameter Transformation and Optimization Mapping
+
+This section defines the parameter transformations used to estimate the Schwartz and Smith (2000) model by maximum likelihood. While the economic parameters of the model are subject to natural constraints, such as positivity of volatilities and bounds on correlations, the numerical optimizer operates on an unconstrained parameter space. Smooth and invertible transformations are therefore required to map between these two representations without altering the underlying model structure.
+
+Parameters that are restricted to be positive, including the mean-reversion speed and the volatilities of the latent factors, are transformed using logarithmic mappings. The correlation between the factor innovations is mapped using a hyperbolic tangent transformation to ensure it remains within the admissible interval (−1,1). Drift and risk-premium parameters, which are unrestricted in sign, enter the optimizer without transformation. These choices are standard in likelihood-based estimation of continuous-time state-space models and ensure numerical stability during optimization.
+
+A slight implementation refinement concerns the treatment of measurement error variances. To allow for zero or near-zero observation noise without imposing hard inequality constraints, a smooth “softplus” transformation is applied to the raw optimizer parameters. This guarantees positivity of the implied variances while preserving differentiability of the likelihood and avoiding numerical singularities in the Kalman filter.
+
+Finally, dedicated packing and unpacking functions provide a clean interface between the optimizer and the state-space model. The `pack` function maps economically meaningful parameters to an unconstrained vector used by the optimizer, while `unpack` performs the inverse mapping inside the likelihood evaluation. This separation ensures that parameter constraints are enforced consistently and transparently throughout the estimation procedure, in line with the conceptual framework of Schwartz and Smith (2000).
+
+```{r step3}
+#############################################################################
+# STEP 3 — Pack/Unpack (allows sigma_obs = 0)
+#############################################################################
+
+# pack(): used to create starting values for optim()
+pack <- function(theta) c(
+  log(theta$kappa),           # kappa > 0  -> log(kappa) in R
+  theta$mu,                   # mu unrestricted
+  theta$mu_star,              # mu* unrestricted (pricing drift)
+  log(theta$sigma_chi),       # sigma_chi > 0 -> log
+  log(theta$sigma_xi),        # sigma_xi > 0 -> log
+  atanh(theta$rho),           # rho in (-1,1) -> atanh
+  theta$lambda_chi,           # lambda_chi unrestricted
+  theta$sigma_obs_raw         # measurement error parameters (raw, unconstrained)
+)
+
+# Softplus transform: smooth, numerically stable mapping from R → R_+
+# Used to enforce positivity of parameters (e.g. variances) without hard constraints
+softplus <- function(x) log1p(exp(-abs(x))) + pmax(x, 0)  
+
+# unpack(): used inside the likelihood, converts optimizer vector back to model parameters
+unpack <- function(p) {
+  # Measurement error parameters: everything after the first 7 model parameters
+  # (one raw parameter per observed contract)
+  if (length(p) < 8) stop("unpack(): parameter vector 'p' is too short.")
+  sigma_obs_raw <- as.numeric(p[8:length(p)])
+
+  eps_sd <- 1e-8  # tiny floor to avoid exact singularities if needed
+  sigma_obs_sd <- softplus(sigma_obs_raw) + eps_sd
+
+  list(
+    kappa          = exp(p[1]),        # mean reversion speed (>0)
+    mu             = p[2],             # drift of xi under P
+    mu_star        = p[3],             # drift term entering A(tau)
+    sigma_chi      = exp(p[4]),        # volatility of chi (>0)
+    sigma_xi       = exp(p[5]),        # volatility of xi (>0)
+    rho            = tanh(p[6]),       # correlation in (-1,1)
+    lambda_chi     = p[7],             # market price of risk for chi
+    sigma_obs_raw  = sigma_obs_raw,    # raw optimizer values (for diagnostics)
+    sigma_obs_vec  = sigma_obs_sd      # measurement SDs used in V
+  )
+}
+
+```
+
+## Step 4: Initialization of Model Parameters and Latent States
+
+This section defines the initialization strategy used for estimating the two factor model of Schwartz and Smith (2000). The authors emphasize that the Kalman filter must be initialized with a prior distribution for the latent state vector, but they also note that the resulting parameter estimates and extracted factors are not particularly sensitive to the exact choice of this initial distribution. As a result, the paper does not prescribe a unique or tightly specified initialization scheme, focusing instead on the robustness of the likelihood-based estimates to reasonable initial conditions.
+
+Consistent with this perspective, the present implementation separates parameter initialization from state initialization. For the numerical optimizer, randomized but economically plausible starting values are generated for all structural parameters, including the mean reversion speed, factor volatilities, drifts, correlation, market price of risk, and measurement error terms. These values serve only as starting points for likelihood maximization and do not impose constraints or prior beliefs on the estimation. This multi-start approach reflects standard practice in nonlinear state-space models and helps mitigate the risk of convergence to local optima.
+
+For the initialization of the latent state vector required by the Kalman filter, a data-based procedure is employed. Rather than relying directly on unconditional moments, the first few measurement equations are pooled after removing the maturity dependent intercept implied by the futures pricing equation, and an early estimate of the short term and long term factors is obtained by ordinary least squares. While this approach differs slightly in implementation from the description in Schwartz and Smith (2000), it is fully consistent with their finding that the precise form of the initial state distribution has limited impact on the estimated parameters.
+
+Finally, the prior covariance matrix of the initial state is constructed using the regression uncertainty and is deliberately inflated to avoid overconfidence in the early state estimates. If the early sample provides insufficient identifying information, the procedure automatically reverts to a diffuse prior. This design ensures numerical stability of the Kalman filter while remaining faithful to the spirit of the initialization strategy discussed in Schwartz and Smith (2000).
+
+```{r step4}
+#############################################################################
+# STEP 4 — Random start values
+#############################################################################
+
+# Provide an initial parameter guess (theta0) for optim()
+# These values are NOT constraints; they are only starting points
+sample_start <- function() {
+  
+  # Initial values for measurement error parameters
+  # (one per futures contract)
+  sigma_obs_raw0 <- rnorm(length(contracts), mean = 0.12, sd = 0.10)
+  # Return parameter list on the natural (economic) scale
+  list(
+    kappa          = runif(1, 0.5, 5),        # mean reversion speed (>0)
+    mu             = runif(1, -0.10, 0.10),   # drift of xi under P
+    mu_star        = runif(1, -0.10, 0.10),   # drift term in A(tau)
+    sigma_chi      = runif(1, 0.05, 0.5),     # volatility of chi (>0)
+    sigma_xi       = runif(1, 0.05, 0.5),     # volatility of xi (>0)
+    rho            = runif(1, -0.95, 0.95),   # correlation (kept away from ±1)
+    lambda_chi     = runif(1, -1, 1),         # market price of risk parameter
+    sigma_obs_raw  = sigma_obs_raw0           # measurement noise (raw scale)
+  )
+}
+
+#############################################################################
+# STEP 4.1 — Data-based prior (POOLED OLS over first L time points)
+#############################################################################
+
+compute_prior_from_first_L <- function(Zt, ct, yt, L = 6, inflate = 2.0, nugget = 1e-8) {
+  # Zt: m x n x T (FKF measurement matrices)
+  # ct: m x T    (measurement intercepts)
+  # yt: m x T    (observations consistent with Zt/ct; ideally masked$yt)
+  #
+  # Pooled prior idea:
+  # Stack the first L measurement equations:
+  #   (y_t - d_t) = F_t x + eps_t
+  # and estimate a single early-state x by pooled OLS.
+  # This is much more stable than solving a separate tiny OLS each week.
+  
+  L <- min(L, ncol(yt))
+  stopifnot(L >= 2)
+  
+  X_stack <- NULL   # stacked design matrix
+  y_stack <- NULL   # stacked response vector
+  
+  for (t in 1:L) {
+    Ft_full <- Zt[, , t]       # m x 2
+    dtvec   <- ct[, t]         # m
+    yvec    <- yt[, t]         # m
+    
+    # Identify rows actually used at time t (missing rows have Ft_full row = 0)
+    obs <- rowSums(abs(Ft_full)) > 0
+    if (sum(obs) < 2) next     # need at least 2 contracts to identify chi, xi
+    
+    Ft <- Ft_full[obs, , drop = FALSE]
+    yy <- as.vector(yvec[obs] - dtvec[obs])
+    
+    # Stack
+    X_stack <- rbind(X_stack, Ft)
+    y_stack <- c(y_stack, yy)
+  }
+  
+  # If too few stacked rows, fall back to diffuse
+  if (is.null(X_stack) || length(y_stack) < 6) {
+    return(list(m0 = c(0, 0), P0 = diag(1e6, 2)))
+  }
+  
+  # Pooled OLS: xhat = argmin || y_stack - X_stack x ||^2
+  fit <- lm.fit(x = X_stack, y = y_stack)
+  m0  <- as.vector(fit$coefficients)
+  
+  if (any(!is.finite(m0))) {
+    return(list(m0 = c(0, 0), P0 = diag(1e6, 2)))
+  }
+  
+  # Prior covariance: use estimated regression uncertainty as a scale proxy
+  # P0 ≈ inflate * s^2 * (X'X)^(-1) + nugget*I
+  n_obs <- length(y_stack)
+  p     <- ncol(X_stack) # should be 2
+  
+  rss <- sum(fit$residuals^2)
+  s2  <- rss / max(1, n_obs - p)
+  
+  XtX_inv <- tryCatch(
+    solve(crossprod(X_stack) + diag(nugget, p)),
+    error = function(e) NULL
+  )
+  
+  if (is.null(XtX_inv) || any(!is.finite(XtX_inv))) {
+    P0 <- diag(1e6, 2)
+  } else {
+    P0 <- inflate * (s2 * XtX_inv + diag(nugget, p))
+    if (any(!is.finite(P0)) || det(P0) <= 0) P0 <- diag(1e6, 2)
+  }
+  
+  list(m0 = m0, P0 = P0)
+}
+
+```
+
+## Step 5: Log-likelihood evaluation and identification robustness checks
+
+This section implements the log-likelihood used to estimate the two factor model of Schwartz and Smith (2000) by maximum likelihood. For each candidate parameter vector proposed by the optimizer, the parameters are first mapped back to their economically meaningful form and the corresponding state-space system is constructed. The Kalman filter is then applied to evaluate the Gaussian likelihood implied by the measurement and transition equations of the model, following the estimation approach described in the original paper.
+
+Schwartz and Smith (2000) note that likelihood values may depend on the assumed initial state distribution, but that reasonable initialization choices have little effect on the resulting parameter estimates. Consistent with this observation, the likelihood function initializes the filter using a data-based prior constructed from early observations, with a diffuse fallback if the early sample does not provide sufficient information. Additional numerical safeguards are included to penalize invalid state-space systems or failed filter evaluations, ensuring stable optimization without altering the statistical objective.
+
+Missing futures price observations are handled explicitly before likelihood evaluation. Because the Kalman filter requires a complete observation vector at each time point, missing prices are accommodated by neutralizing their influence in the measurement equation and inflating their associated measurement error variances. This allows unavailable contracts to be ignored by the filter while preserving the dimensional consistency of the state-space system and maintaining numerical stability.
+
+Finally, the section introduces a set of alternative likelihood functions used for identification and robustness analysis. Schwartz and Smith (2000) discuss that certain combinations of drift and risk premium parameters may be weakly identified from futures prices alone. To make this issue transparent, additional objective functions are defined that impose fixed values or soft penalties on selected parameter combinations, as well as targeted checks for the market price of risk parameter. These variants are not used for baseline estimation but provide diagnostic evidence on the stability and identification of the model’s key parameters.
+
+```{r step5}
+#############################################################################
+# STEP 5 — Log-likelihood
+#############################################################################
+
+loglik <- function(p, Y, Tau, Delta_t) {
+  # 1) Map optimizer vector -> model parameters (natural scale)
+  theta <- unpack(p)
+  # 2) Build state-space system from theta + maturities (paper Eq. 14 & 15)
+  ss <- make_ss_arrays(theta, Tau, Delta_t)
+  # Penalize invalid A(tau) / intercept values (numerical safety)
+  if (any(!is.finite(ss$ct))) return(1e6)
+  # 3) Handle missing observations in Y (mask rows + inflate measurement variance)
+  masked <- apply_missing_mask_fkf(Y, ss)
+  # 4) Prior for initial state x0 = (chi0, xi0)' ~ N(m0, P0)
+  L_use <- max(4, min(6, ncol(Y)))
+  prior <- tryCatch(
+    compute_prior_from_first_L(masked$Zt, masked$ct, masked$yt, L = L_use, inflate = 2.0),
+    error = function(e) list(m0 = c(0,0), P0 = diag(1e6, 2))
+  )
+  # 5) Run Kalman filter (paper recursion after Eq. 14–16)
+  kf <- tryCatch(
+    fkf(
+      a0  = prior$m0, P0 = prior$P0,     # initial state mean/cov
+      dt  = masked$dt, ct = masked$ct,   # state intercept (FKF name dt) + measurement intercept
+      Tt  = masked$Tt, Zt = masked$Zt,   # transition matrix + measurement matrix
+      HHt = masked$HHt, GGt = masked$GGt,# state noise cov + measurement noise cov
+      yt  = masked$yt                    # observations (NA replaced + masked system)
+    ),
+    error = function(e) NULL
+  )
+  
+  # Penalize failed KF run or invalid likelihood
+  if (is.null(kf) || !is.finite(kf$logLik)) return(1e6)
+  
+  # Return negative log-likelihood for minimization
+  -kf$logLik
+}
+
+
+#############################################################################
+# STEP 5.1 — Identification robustness (restricted / penalized objectives)
+#############################################################################
+
+# Fix lambda_xi = mu - mu_star to a chosen value (benchmark: 0)
+loglik_fix_lambda_xi <- function(p, Y, Tau, Delta_t, lambda_xi_fixed = 0) {
+  theta <- unpack(p)
+  
+  # enforce mu_star = mu - lambda_xi
+  theta$mu_star <- theta$mu - lambda_xi_fixed
+  
+  ss <- make_ss_arrays(theta, Tau, Delta_t)
+  if (any(!is.finite(ss$ct))) return(1e6)
+  
+  masked <- apply_missing_mask_fkf(Y, ss)
+  
+  L_use <- max(4, min(6, ncol(Y)))
+  prior <- tryCatch(
+    compute_prior_from_first_L(masked$Zt, masked$ct, masked$yt, L = L_use, inflate = 2.0),
+    error = function(e) list(m0 = c(0,0), P0 = diag(1e6, 2))
+  )
+  
+  kf <- tryCatch(
+    fkf(
+      a0  = prior$m0, P0 = prior$P0,
+      dt  = masked$dt, ct = masked$ct,
+      Tt  = masked$Tt, Zt = masked$Zt,
+      HHt = masked$HHt, GGt = masked$GGt,
+      yt  = masked$yt
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(kf) || !is.finite(kf$logLik)) return(1e6)
+  -as.numeric(kf$logLik)
+}
+
+# Softly penalize lambda_xi toward a target (benchmark: 0)
+loglik_penalize_lambda_xi <- function(p, Y, Tau, Delta_t, lambda_xi0 = 0, w = 10) {
+  theta <- unpack(p)
+  nll <- loglik(p, Y, Tau, Delta_t)
+  lambda_xi <- theta$mu - theta$mu_star
+  nll + w * (lambda_xi - lambda_xi0)^2
+}
+
+
+## lambda_chi identification check
+# Fix lambda_chi to a chosen value
+loglik_fix_lambda_chi <- function(p, Y, Tau, Delta_t, lambda_chi_fixed) {
+  theta <- unpack(p)
+  theta$lambda_chi <- lambda_chi_fixed
+  
+  ss <- make_ss_arrays(theta, Tau, Delta_t)
+  if (any(!is.finite(ss$ct))) return(1e6)
+  
+  masked <- apply_missing_mask_fkf(Y, ss)
+  
+  L_use <- max(4, min(6, ncol(Y)))
+  prior <- tryCatch(
+    compute_prior_from_first_L(masked$Zt, masked$ct, masked$yt, L = L_use, inflate = 2.0),
+    error = function(e) list(m0 = c(0,0), P0 = diag(1e6, 2))
+  )
+  
+  kf <- tryCatch(
+    fkf(a0=prior$m0, P0=prior$P0,
+        dt=masked$dt, ct=masked$ct,
+        Tt=masked$Tt, Zt=masked$Zt,
+        HHt=masked$HHt, GGt=masked$GGt,
+        yt=masked$yt),
+    error = function(e) NULL
+  )
+  
+  if (is.null(kf) || !is.finite(kf$logLik)) return(1e6)
+  -as.numeric(kf$logLik)
+}
+
+# Penalize lambda_chi toward a target
+loglik_penalize_lambda_chi <- function(p, Y, Tau, Delta_t, lambda_chi0, w = 10) {
+  nll <- loglik(p, Y, Tau, Delta_t)
+  theta <- unpack(p)
+  nll + w * (theta$lambda_chi - lambda_chi0)^2
+}
+
+theta0 <- sample_start()
+p0 <- pack(theta0)
+val <- loglik(p0, Y, Tau, Delta_t)
+cat("loglik(p0) =", val, "\n")
+is.finite(val)
+
+
+is.finite(loglik_fix_lambda_xi(p0, Y, Tau, Delta_t, lambda_xi_fixed = 0))
+is.finite(loglik_fix_lambda_chi(p0, Y, Tau, Delta_t, lambda_chi_fixed = 0))
+
+base <- loglik(p0, Y, Tau, Delta_t)
+pen  <- loglik_penalize_lambda_xi(p0, Y, Tau, Delta_t, lambda_xi0 = 0, w = 10)
+pen >= base
+
+```
+
+## Step 6: Maximum likelihood estimation and robustness analysis
+
+This section estimates the Schwartz and Smith (2000) two factor model by maximum likelihood using the log-likelihood function defined in the previous step. The paper motivates estimation through the Kalman filter likelihood but does not provide detailed guidance on numerical optimization. In practice, likelihood surfaces for state-space models can be sensitive to starting values and may contain local optima, so the estimation is implemented using a multi-start strategy.
+
+Specifically, the optimizer is run multiple times from randomized but economically plausible starting values for the structural parameters. Each run evaluates the likelihood through the Kalman filter, and the solution with the highest likelihood is retained as the preferred estimate. The final parameter vector is then mapped back to economically interpretable quantities and stored for subsequent analysis, along with implied quantities that are convenient for interpretation and comparisons across specifications.
+
+Schwartz and Smith (2000) discuss that certain parameters and parameter combinations can be difficult to identify precisely from futures prices alone. To assess whether this issue is relevant in the present dataset, the section performs additional estimations under alternative objective functions that impose either hard restrictions or soft penalties on selected parameters. These exercises are designed to reveal whether the unrestricted estimates are stable or whether the likelihood is relatively flat along certain directions.
+
+Finally, the estimation includes a targeted identification check for the market price of risk parameter associated with the short-term factor. The model is re-estimated while fixing this parameter on a small grid around its estimated value, and the resulting likelihood values are compared. These robustness checks are not intended to replace the baseline maximum likelihood estimates, but they provide transparent diagnostics on identification strength and the sensitivity of key parameters within the Schwartz and Smith (2000) framework.
+
+```{r step6}
+#############################################################################
+# STEP 6 — MLE (Multi-start + diagnostics + automatic removal of degenerate runs)
+#############################################################################
+
+# Generate multiple random starting parameter guesses (theta0),
+# then convert each to optimizer vector form p0 via pack()
+init_vecs <- replicate(8, pack(sample_start()), simplify = FALSE)
+
+# Run optim() from each starting point and collect all fits
+fits <- purrr::map(
+  init_vecs,
+  ~ optim(
+      par = .x,
+      fn = loglik,
+      Y = Y,
+      Tau = Tau,
+      Delta_t = Delta_t,          # time step between observations (weekly in years)
+      method = "BFGS",
+      control = list(maxit = 4000, reltol = 1e-10)
+    )
+)
+
+# Select the run with the smallest objective value (= best negative log-likelihood)
+best <- fits[[which.min(purrr::map_dbl(fits, "value"))]]
+
+# Convert the best optimizer vector back to model parameters
+theta_hat_SS_FullTimeline_V2.0 <- unpack(best$par)
+
+# Assign a class for custom printing / plotting methods (optional)
+class(theta_hat_SS_FullTimeline_V2.0) <- "theta_hat"
+
+# Report the converged (maximized) log-likelihood
+message(sprintf("Converged log-likelihood (Full Timeline V2.0): %.2f", -best$value))
+
+# Implied lambda_xi from mu and mu_star (often interpreted as long-run risk premium term)
+theta_hat_SS_FullTimeline_V2.0$lambda_xi_implied <-
+  theta_hat_SS_FullTimeline_V2.0$mu - theta_hat_SS_FullTimeline_V2.0$mu_star
+
+
+
+#############################################################################
+# STEP 6.1 — Robustness: re-estimate under identification restrictions
+#############################################################################
+
+# (A) Fix lambda_xi = 0 benchmark
+best_fix_lx0 <- optim(
+  par = best$par,
+  fn  = loglik_fix_lambda_xi,
+  Y = Y, Tau = Tau, Delta_t = Delta_t,
+  lambda_xi_fixed = 0,
+  method = "BFGS",
+  control = list(maxit = 4000, reltol = 1e-10)
+)
+
+theta_fix_lx0 <- unpack(best_fix_lx0$par)
+theta_fix_lx0$mu_star <- theta_fix_lx0$mu  # enforce lambda_xi=0
+theta_fix_lx0$lambda_xi_implied <- 0
+class(theta_fix_lx0) <- "theta_hat"
+
+message(sprintf("Robustness (fix lambda_xi=0): logLik = %.2f", -best_fix_lx0$value))
+print(theta_fix_lx0)
+
+# (B) Penalize lambda_xi toward 0 (soft constraint)
+best_pen_lx <- optim(
+  par = best$par,
+  fn  = loglik_penalize_lambda_xi,
+  Y = Y, Tau = Tau, Delta_t = Delta_t,
+  lambda_xi0 = 0, w = 10,
+  method = "BFGS",
+  control = list(maxit = 4000, reltol = 1e-10)
+)
+
+theta_pen_lx <- unpack(best_pen_lx$par)
+theta_pen_lx$lambda_xi_implied <- theta_pen_lx$mu - theta_pen_lx$mu_star
+class(theta_pen_lx) <- "theta_hat"
+
+message(sprintf("Robustness (penalize lambda_xi~0): logLik = %.2f", -best_pen_lx$value))
+print(theta_pen_lx)
+
+
+## lambda_chi identification check
+# (C) Identification check for lambda_chi
+lambda_chi_hat <- theta_hat_SS_FullTimeline_V2.0$lambda_chi
+grid <- lambda_chi_hat + c(-0.10, -0.05, 0, 0.05, 0.10)
+
+audit_lc <- purrr::map_dfr(grid, function(lc) {
+  fit <- optim(
+    par = best$par,
+    fn  = loglik_fix_lambda_chi,
+    Y = Y, Tau = Tau, Delta_t = Delta_t,
+    lambda_chi_fixed = lc,
+    method = "BFGS",
+    control = list(maxit = 4000, reltol = 1e-10)
+  )
+  tibble(
+    lambda_chi_fixed = lc,
+    logLik = -fit$value
+  )
+})
+
+print(audit_lc)
+
+# (D) Soft penalty toward baseline (sanity check)
+best_pen_lc <- optim(
+  par = best$par,
+  fn  = loglik_penalize_lambda_chi,
+  Y = Y, Tau = Tau, Delta_t = Delta_t,
+  lambda_chi0 = lambda_chi_hat, w = 10,
+  method = "BFGS",
+  control = list(maxit = 4000, reltol = 1e-10)
+)
+message(sprintf("Robustness (penalize lambda_chi~hat): logLik = %.2f", -best_pen_lc$value))
+
+```
+
+The maximum likelihood estimation on the full timeline converges cleanly and yields a substantially higher log-likelihood than in the restricted-sample case, reflecting the much larger number of observations used in the estimation. The estimated parameters governing the dynamics of the latent factors are economically reasonable and stable, with moderate mean reversion in the short-term factor, persistent variation in the long-term factor, and a relatively low correlation between their innovations. This confirms that the core structure of the Schwartz and Smith (2000) model remains well supported when applied to a longer historical sample.
+
+The robustness checks concerning the long-run risk premium component indicate that this parameter combination remains weakly identified even on the full timeline. When imposing the hard restriction that the long-run risk premium is set to zero, the maximized log-likelihood decreases only marginally relative to the unrestricted estimate. The drop in fit is small compared to the overall likelihood level, suggesting that allowing this component to vary freely provides little additional explanatory power. This finding closely mirrors the results obtained on the shorter sample and is fully consistent with the discussion in Schwartz and Smith (2000), who emphasize that futures prices primarily identify factor dynamics and maturity-dependent loadings rather than drift decompositions.
+
+The corresponding parameter estimates under the restriction remain very close to the unrestricted estimates for the key structural parameters, including the mean reversion speed, factor volatilities, and correlation. As expected, the drift parameters coincide under the restriction, while the overall fit of the model remains essentially unchanged. This reinforces the interpretation that the empirical content of the model is driven mainly by the stochastic behavior of the latent factors, rather than by precise estimation of long-run drift components.
+
+The soft-penalty specification provides a complementary perspective. Penalizing the long-run risk premium toward zero leaves the likelihood virtually unchanged and results in parameter estimates that are almost identical to the unrestricted solution. Although Schwartz and Smith (2000) do not explicitly discuss penalized estimation, they note that their results are robust to reasonable modeling choices. The behavior observed here is consistent with this robustness, as the penalty does not materially alter either the likelihood or the estimated parameters.
+
+Finally, the identification check for the market price of risk associated with the short-term factor shows a relatively flat likelihood profile around the estimated value. Fixing this parameter over a small grid produces only negligible changes in the likelihood, and penalizing it toward the unrestricted estimate leaves the fit unchanged. While Schwartz and Smith (2000) interpret this parameter economically, they do not provide formal identification diagnostics. The flat likelihood surface observed here suggests that, even with a longer sample, this parameter is only weakly identified by futures prices alone. Overall, these findings reinforce the central message of Schwartz and Smith (2000): the dominant empirical contribution of the model lies in capturing the dynamics of latent factors and their maturity-dependent impact on futures prices, rather than in precise estimation of all risk premium components.
+
+## Step 7: Final Kalman Filtering and Diagnostic Analysis
+
+This section performs the final Kalman filtering step using the maximum likelihood parameter estimates obtained in the previous section. Schwartz and Smith (2000) derive their likelihood function using the Kalman filter but do not explicitly describe a separate post-estimation filtering step. In practice, however, once the parameter estimates are fixed, it is standard to re-run the filter to extract the latent state paths and diagnostic quantities implied by the fitted model. This step therefore applies the Kalman filter one final time using the estimated parameters and the full observation sample.
+
+The state-space system is reconstructed at the estimated parameters, and the filter is initialized using the same data-based prior as in the likelihood evaluation. This ensures internal consistency between estimation and post-estimation analysis. Missing futures price observations are handled in the same way as before, by masking their contribution in the measurement equation and inflating the associated measurement error variances, so that unavailable contracts do not influence the state estimates.
+
+In addition to producing filtered state estimates, the Kalman filter generates measurement innovations and their associated covariance matrices. These quantities are used to construct standardized innovations for each contract as a diagnostic tool. Under correct model specification, these standardized innovations should be approximately centered around zero with stable dispersion over time. Examining their distribution across maturities provides a practical way to assess overall model fit and to identify potential anomalies in the measurement equation.
+
+Finally, the section includes targeted diagnostics for contracts with very small estimated measurement error variances. Schwartz and Smith (2000) do not explicitly discuss this issue, but in practice such contracts can act as anchors that exert disproportionate influence on the filter. By comparing estimated measurement noise with the dispersion of standardized innovations, the diagnostics help ensure that no single contract dominates the state estimation. All relevant fitted objects are then saved for downstream analysis, including visualization, interpretation of latent factors, and forecasting.
+
+```{r step7}
+#############################################################################
+# STEP 7 — Refit Kalman filter at final MLE estimates and save fit objects
+#############################################################################
+# Purpose:
+# - Run the Kalman filter one final time at the estimated parameters theta_hat
+# - Store the fitted filter object and inputs for plots and diagnostics later
+
+# Build state-space system at the estimated parameters
+ss_hat <- make_ss_arrays(theta_hat_SS_FullTimeline_V2.0, Tau, Delta_t)
+
+# Apply missing-data masking so FKF can handle NAs consistently
+# Returns FKF-ready objects: yt, Zt, ct, GGt, Tt, dt, HHt
+masked_h <- apply_missing_mask_fkf(Y, ss_hat)
+
+# Construct the initial prior for the latent state x0 = (chi0, xi0)'
+# Using early-sample pooled OLS; falls back to a diffuse prior if needed
+L_use <- max(4, min(6, ncol(Y)))
+prior_hat <- tryCatch(
+  compute_prior_from_first_L(masked_h$Zt, masked_h$ct, masked_h$yt, L = L_use, inflate = 2.0),
+  error = function(e) list(m0 = c(0,0), P0 = diag(1e6, 2))
+)
+m0_hat <- prior_hat$m0
+P0_hat <- prior_hat$P0
+
+# Run Kalman filter at the estimated parameters
+# FKF naming:
+#   dt = state intercepts (paper c_t), ct = measurement intercepts (paper d_t)
+#   Tt = transition matrix (paper G_t), Zt = measurement matrix (paper F_t)
+#   HHt = state noise covariance (paper W_t), GGt = measurement noise covariance (paper V_t)
+kf_hat <- fkf(
+  a0  = m0_hat, P0 = P0_hat,             # initial state prior mean/covariance
+  dt  = masked_h$dt, ct  = masked_h$ct,  # state intercept + measurement intercept
+  Tt  = masked_h$Tt, Zt  = masked_h$Zt,  # transition matrix + measurement matrix
+  HHt = masked_h$HHt, GGt = masked_h$GGt,# process noise cov + measurement noise cov
+  yt  = masked_h$yt                      # observations (NAs replaced, system masked)
+)
+
+#############################################################################
+# STEP 7.1 — Standardized innovations and measurement diagnostics
+#############################################################################
+# Purpose:
+# - Compute standardized innovations per contract as a residual diagnostic
+# - Summarize innovation behavior across maturities
+# - Flag contracts that behave like "anchors" due to near-zero measurement noise
+
+# FKF outputs used here:
+# - vt : innovations (measurement residuals) v_t = y_t - E[y_t | t-1]     (m x T)
+# - Ft : innovation covariance matrices Q_t                              (m x m x T)
+vt <- kf_hat$vt
+Qt <- kf_hat$Ft
+
+m <- nrow(vt)
+T_len <- ncol(vt)
+
+# Standardize innovations contract-by-contract:
+#   z_{i,t} = v_{i,t} / sqrt(Q_{t,ii})
+# This should be approximately mean 0 and variance 1 if the model is well-specified.
+std_innov <- matrix(NA_real_, nrow = m, ncol = T_len)
+for (tt in seq_len(T_len)) {
+  Qdiag <- diag(Qt[,,tt])
+  std_innov[, tt] <- vt[, tt] / sqrt(Qdiag)
+}
+
+# Restore missingness: mark standardized innovations as NA wherever Y was missing
+# (so summaries are not distorted by placeholder values used in the masked system)
+miss_mask <- is.na(Y)
+std_innov[miss_mask] <- NA_real_
+
+# Summary diagnostics by contract (row corresponds to contract)
+innov_summary <- tibble(
+  contract = rownames(Y),
+  mean     = rowMeans(std_innov, na.rm = TRUE),
+  sd       = apply(std_innov, 1, sd, na.rm = TRUE),
+  q05      = apply(std_innov, 1, quantile, probs = 0.05, na.rm = TRUE),
+  q50      = apply(std_innov, 1, quantile, probs = 0.50, na.rm = TRUE),
+  q95      = apply(std_innov, 1, quantile, probs = 0.95, na.rm = TRUE)
+)
+print(innov_summary)
+
+# Anchor-style diagnostic:
+# Contracts with (estimated) near-zero measurement error can dominate the filter.
+# Here we flag very small sigma_obs and compare to innovation dispersion.
+tiny_sd <- theta_hat_SS_FullTimeline_V2.0$sigma_obs_vec < 1e-4
+anchor_flag <- tibble(
+  contract  = rownames(Y),
+  sigma_obs = theta_hat_SS_FullTimeline_V2.0$sigma_obs_vec,
+  innov_sd  = apply(std_innov, 1, sd, na.rm = TRUE),
+  is_tiny_sd = tiny_sd
+)
+print(anchor_flag)
+
+# Optional additional check: is the mean innovation close to zero?
+innov_summary2 <- innov_summary %>%
+  mutate(mean_abs = abs(mean),
+         mean_ok  = mean_abs < 0.10)
+print(innov_summary2)
+
+#############################################################################
+# Save objects needed for downstream analysis (plots, diagnostics, forecasting)
+#############################################################################
+
+dir.create("results", showWarnings = FALSE)
+
+saveRDS(
+  list(
+    theta     = theta_hat_SS_FullTimeline_V2.0,
+    kf        = kf_hat,
+    Y         = Y,
+    Tau       = Tau,
+    Delta_t   = Delta_t,
+    obs_dates = obs_dates,
+    best      = if (exists("best")) best else NULL
+  ),
+  "results/ss_fit_FullTimeline_V2.0.rds"
+)
+
+
+
+
+```
+
+The standardized innovations summarized in the innovation diagnostics provide a direct assessment of the measurement equation implied by the fitted state-space model. Across all five futures maturities, the innovation means are close to zero and remain well below 0.1 in absolute value, while the standard deviations are all very close to one. In addition, the reported lower and upper quantiles are broadly symmetric around zero. These patterns are consistent with the Gaussian assumptions underlying the Kalman filter and indicate a satisfactory overall fit of the model to the full panel of futures prices.
+
+Comparing innovation behavior across maturities shows a high degree of uniformity between short-dated and long-dated contracts. Dispersion and quantile ranges are remarkably similar across the curve, suggesting that no particular maturity is systematically under- or over-fitted. This supports the maturity-dependent factor loadings implied by the Schwartz and Smith (2000) model and indicates that the two latent factors provide a coherent representation of price dynamics across the entire futures curve.
+
+The anchor diagnostics reveal that the nine-month futures contract has an extremely small estimated measurement error variance and therefore acts as a strong anchor in the Kalman filter. Importantly, the standardized innovation dispersion for this contract remains close to one, indicating that its strong influence does not result in abnormal residual behavior or numerical instability. While this contract receives substantial weight in the filtering step, its behavior remains fully consistent with the assumptions of the measurement equation.
+
+Overall, the innovation summaries and anchor diagnostics do not reveal evidence of misspecification or pathological behavior in the fitted model. Taken together with the clean convergence of the Kalman filter and the stability of the standardized innovations across maturities, these results support the internal consistency of the estimated state-space representation and justify its use for subsequent analysis of the latent factors, term structure dynamics, and forecasting applications.
+
+## Print the Output
+
+```{r printoutput}
+#############################################################################
+# Print (sigma_obs_raw is hidden by custom print method)
+#############################################################################
+
+print(theta_hat_SS_FullTimeline_V2.0)
+
+```
+
+## Safe important functions and output for later use
+
+```{r export-analytics-bundle, echo=TRUE}
+# =====================================================================
+# EXPORT: Analytics bundle (everything needed to knit Analytics safely)
+# =====================================================================
+
+dir.create("results", showWarnings = FALSE, recursive = TRUE)
+
+# Optional helper (only used below)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# --- 1) Save a clean bundle of objects Analytics will load ---
+fit_bundle <- list(
+  theta_hat = theta_hat_SS_FullTimeline_V2.0,
+  Y         = Y,
+  Tau       = Tau,
+  Delta_t   = Delta_t,
+  obs_dates = if (exists("obs_dates")) obs_dates else NULL,
+  kf        = if (exists("kf_hat")) kf_hat else if (exists("kf")) kf else NULL,
+  best      = if (exists("best")) best else NULL
+)
+
+saveRDS(fit_bundle, file = "results/ss_fit_bundle_for_analytics_FullTimeline_V2.0.rds")
+
+# --- 2) Export the exact functions Analytics needs as a plain .R file ---
+fn_names <- c(
+  "softplus", "process_W",
+  "pack", "unpack", "loglik",
+  "make_ss_arrays", "A_fun",
+  "apply_missing_mask_fkf", "compute_prior_from_first_L",
+  "sample_start"
+)
+
+
+missing_fns <- fn_names[!vapply(fn_names, exists, logical(1), mode = "function", inherits = TRUE)]
+if (length(missing_fns) > 0) {
+  stop("Cannot export analytics functions. Missing functions: ",
+       paste(missing_fns, collapse = ", "), call. = FALSE)
+}
+
+fun_lines <- unlist(lapply(fn_names, function(nm) {
+  f_txt <- deparse(get(nm, mode = "function"), control = c("keepInteger", "showAttributes"))
+  # First line becomes: "loglik <- function(...)" instead of "function(...)"
+  f_txt[1] <- paste0(nm, " <- ", f_txt[1])
+  c(paste0("## ---- ", nm, " ----"), f_txt, "")
+}), use.names = FALSE)
+
+
+writeLines(fun_lines, con = "results/ss_functions_for_analytics_FullTimeline_V2.0.R")
+
+message("Exported: results/ss_fit_bundle_for_analytics_FullTimeline_V2.0.rds")
+message("Exported: results/ss_functions_for_analytics_FullTimeline_V2.0.R")
+
+
+
+```
+
+
+```{r additional check}
+# ── Roll / LTD diagnostic ────────────────────────────────────────────────────
+# Counts the fraction of weekly observations where CL1 is observed at tau = 0
+# (i.e. the Friday observation date coincides with the contract's LTD).
+# These are the weeks where CL1 is dropped from the Kalman filter measurement.
+
+cl1_ltd_vec <- as.Date(weekly_win[["CL1 Comdty__LTD"]])
+cl1_und_vec <- weekly_win[["CL1 Comdty__UND"]]
+obs_date_vec <- as.Date(weekly_win[["date"]])
+
+# Identify roll weeks (UND changes from prior week)
+roll_flag <- c(FALSE, cl1_und_vec[-1] != cl1_und_vec[-length(cl1_und_vec)])
+roll_flag[is.na(cl1_und_vec)] <- NA
+
+# For each roll, classify: was the last pre-roll Friday the LTD? (gap = 0)
+# or did the contract expire mid-week? (gap > 0)
+roll_idx <- which(roll_flag == TRUE)
+
+gap_days <- sapply(roll_idx, function(i) {
+  ltd  <- cl1_ltd_vec[i - 1]
+  date <- obs_date_vec[i - 1]
+  if (is.na(ltd)) return(NA_integer_)
+  as.integer(ltd - date)
+})
+
+gap_days  <- gap_days[!is.na(gap_days)]
+total_obs  <- nrow(weekly_win)
+total_rolls <- length(gap_days)
+n_friday_ltd <- sum(gap_days == 0)
+n_midweek    <- sum(gap_days >  0)
+
+message("══════════════════════════════════════════════════════")
+message("  CL1 Roll / LTD Diagnostic — SS-2000 Full Timeline")
+message("══════════════════════════════════════════════════════")
+message(sprintf("  Sample             : %s to %s",
+                min(obs_date_vec), max(obs_date_vec)))
+message(sprintf("  Total weekly obs   : %d", total_obs))
+message(sprintf("  Total rolls        : %d", total_rolls))
+message("")
+message("  Case 1 — LTD is a Friday (obs date = LTD, tau = 0):")
+message(sprintf("    Weeks affected   : %d", n_friday_ltd))
+message(sprintf("    %% of all rolls  : %.1f%%", 100 * n_friday_ltd / total_rolls))
+message(sprintf("    %% of all obs    : %.1f%%", 100 * n_friday_ltd / total_obs))
+message("")
+message("  Case 2 — LTD is Mon-Thu (contract expires mid-week, never seen at tau=0):")
+message(sprintf("    Weeks affected   : %d", n_midweek))
+message(sprintf("    %% of all rolls  : %.1f%%", 100 * n_midweek / total_rolls))
+message("")
+message("  >> Kalman filter drops CL1 in Case 1 weeks only.")
+message(sprintf("  >> That is %d out of %d observations (%.1f%% of the full sample).",
+                n_friday_ltd, total_obs, 100 * n_friday_ltd / total_obs))
+message("══════════════════════════════════════════════════════")
+
+
+```
+
